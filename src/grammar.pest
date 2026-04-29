@@ -1,0 +1,44 @@
+WHITESPACE = _{ " " | "\t" }
+
+program     = { SOI ~ statement ~ EOI }
+statement   = { assignment | expression }
+assignment  = { ident ~ "=" ~ expression }
+expression  = { conversion }
+
+conversion  = { addsub ~ (in_kw ~ unit_expr)? }
+in_kw       = @{ "in" ~ !(ASCII_ALPHANUMERIC | "_") }
+
+addsub      = { addsub_term ~ (add_op ~ addsub_term)* }
+add_op      = { "+" | "-" }
+
+addsub_term = { neg_op? ~ muldiv }
+neg_op      = { "-" }
+
+// Implicit multiplication: a power adjacent to another power (no operator)
+// means multiplication. So `4 mph` parses as `4 * mph`, and `42/4 mph` as
+// `42 / 4 * mph = (42/4) * mph = 10.5 mph` (left-assoc).
+muldiv      = { power ~ (mul_op? ~ power)* }
+mul_op      = { "*" | "/" }
+
+power       = { atom ~ ("^" ~ pow_exp)? }
+pow_exp     = { neg_op? ~ atom }
+
+atom        = { time_with_unit | number | call | var | paren }
+paren       = { "(" ~ expression ~ ")" }
+call        = { ident ~ "(" ~ expression ~ ("," ~ expression)* ~ ")" }
+var         = { ident }
+time_with_unit   = { time_literal ~ unit_expr? }
+
+unit_expr   = { unit_factor ~ (unit_op ~ unit_factor)* }
+unit_op     = { "*" | "/" }
+unit_factor = { ident ~ ("^" ~ int)? }
+
+time_literal = ${ hms_form | ms_form }
+hms_form     = ${ uint ~ ":" ~ uint ~ ":" ~ number }
+ms_form      = ${ uint ~ ":" ~ number }
+
+number      = @{ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
+uint        = @{ ASCII_DIGIT+ }
+int         = @{ "-"? ~ ASCII_DIGIT+ }
+keyword     = @{ in_kw }
+ident       = @{ !keyword ~ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }

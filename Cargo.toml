@@ -1,0 +1,18 @@
+[package]
+name = "poppop"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "poppop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "poppop"
+path = "src/main.rs"
+
+[dependencies]
+pest = "2.7"
+pest_derive = "2.7"
+thiserror = "2.0"
+rustyline = "14"
