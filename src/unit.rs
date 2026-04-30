@@ -135,16 +135,44 @@ pub fn unit_time_factor(expr: &UnitExpr) -> f64 {
     }
 }
 
+/// Per-atom registry record. Most units have `offset = 0.0` and
+/// `is_affine_temp = false`. Only Celsius and Fahrenheit (and their aliases)
+/// carry non-zero offsets and `is_affine_temp = true`. The `offset` is the
+/// Kelvin value corresponding to a magnitude of 0 in the affine scale;
+/// e.g. `0 °C = 273.15 K` so degC has offset 273.15.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AtomDef {
+    pub unit: Unit,
+    pub factor: f64,
+    pub offset: f64,
+    pub is_affine_temp: bool,
+}
+
+impl AtomDef {
+    pub fn linear(unit: Unit, factor: f64) -> Self {
+        AtomDef { unit, factor, offset: 0.0, is_affine_temp: false }
+    }
+}
+
+/// Result of resolving a `UnitExpr`. For single-atom expressions we carry
+/// the atom's offset and affine flag through so eval can decide whether to
+/// apply offset math (only on single-atom affine literals).
+#[derive(Debug)]
+pub struct Resolved {
+    pub unit: Unit,
+    pub factor: f64,
+    /// `Some` when the resolution was a single bare atom and that atom
+    /// has affine metadata that callers may need (i.e. `is_affine_temp`
+    /// or non-zero `offset`). `None` for compound expressions or for
+    /// linear single atoms — those callers don't need the extra info.
+    pub atom: Option<AtomDef>,
+}
+
 pub struct UnitRegistry {
-    atoms: HashMap<String, (Unit, f64)>,
+    atoms: HashMap<String, AtomDef>,
     /// SI prefixes loaded from pint. Keyed by the full prefix word ("kilo")
     /// AND the symbol form ("k"). Value is the multiplier.
     prefixes: HashMap<String, f64>,
-    /// Names we've intentionally excluded — temperature scales with non-zero
-    /// offsets (celsius, fahrenheit, rankine, …). These would silently give
-    /// wrong answers under our linear-conversion model, so we surface them
-    /// as a specific error instead.
-    excluded_offsets: std::collections::HashSet<String>,
 }
 
 impl UnitRegistry {
@@ -152,16 +180,7 @@ impl UnitRegistry {
         UnitRegistry {
             atoms: HashMap::new(),
             prefixes: HashMap::new(),
-            excluded_offsets: std::collections::HashSet::new(),
         }
-    }
-
-    pub fn add_excluded_offset(&mut self, name: &str) {
-        self.excluded_offsets.insert(name.to_string());
-    }
-
-    pub fn is_excluded_offset(&self, name: &str) -> bool {
-        self.excluded_offsets.contains(name)
     }
 
     pub fn standard() -> Self {
@@ -170,8 +189,14 @@ impl UnitRegistry {
         reg
     }
 
+    /// Linear-only atom registration (no offset). The legacy entry point.
     pub fn add_atom(&mut self, name: &str, unit: Unit, factor: f64) {
-        self.atoms.insert(name.to_string(), (unit, factor));
+        self.atoms.insert(name.to_string(), AtomDef::linear(unit, factor));
+    }
+
+    /// Full atom registration including offset and affine-temp metadata.
+    pub fn add_atom_full(&mut self, name: &str, def: AtomDef) {
+        self.atoms.insert(name.to_string(), def);
     }
 
     pub fn atom_count(&self) -> usize {
@@ -182,46 +207,68 @@ impl UnitRegistry {
         self.prefixes.insert(name.to_string(), factor);
     }
 
-    pub fn lookup_atom(&self, name: &str) -> Option<(Unit, f64)> {
-        if let Some((u, f)) = self.atoms.get(name) {
-            return Some((*u, *f));
+    pub fn lookup_atom(&self, name: &str) -> Option<AtomDef> {
+        if let Some(def) = self.atoms.get(name) {
+            return Some(*def);
         }
         // Try prefix expansion: if the name starts with a known prefix and the
         // remainder is an atom, combine them. Longer prefix matches first.
+        // Prefixed lookups never produce affine units (offset is zero there
+        // by construction — pint's affine atoms aren't prefixable anyway).
         let mut keys: Vec<&String> = self.prefixes.keys().collect();
         keys.sort_by(|a, b| b.len().cmp(&a.len()));
         for prefix in keys {
             if let Some(rest) = name.strip_prefix(prefix.as_str()) {
-                if let Some((u, f)) = self.atoms.get(rest) {
+                if let Some(def) = self.atoms.get(rest) {
                     let scale = self.prefixes[prefix];
-                    return Some((*u, *f * scale));
+                    return Some(AtomDef {
+                        unit: def.unit,
+                        factor: def.factor * scale,
+                        offset: 0.0,
+                        is_affine_temp: false,
+                    });
                 }
             }
         }
         None
     }
 
-    pub fn resolve(&self, expr: &UnitExpr) -> Result<(Unit, f64), Error> {
+    /// Resolve a `UnitExpr` to base unit + factor. For single bare atoms,
+    /// the resolved atom record (including offset and affine-temp flag) is
+    /// returned in `atom` so eval can detect affine literals at construction
+    /// time. Compound expressions return `atom = None` — by definition,
+    /// affine offsets only apply to literal single-atom usages.
+    pub fn resolve(&self, expr: &UnitExpr) -> Result<Resolved, Error> {
         match expr {
             UnitExpr::Atom(name, exp) => {
-                let (u, f) = self.lookup_atom(name).ok_or_else(|| {
-                    if self.is_excluded_offset(name) {
-                        Error::OffsetUnit(name.clone())
-                    } else {
-                        Error::UnknownUnit(name.clone())
-                    }
-                })?;
-                Ok((u.pow(*exp), f.powi(*exp)))
+                let def = self
+                    .lookup_atom(name)
+                    .ok_or_else(|| Error::UnknownUnit(name.clone()))?;
+                let unit = def.unit.pow(*exp);
+                let factor = def.factor.powi(*exp);
+                // Affine info only flows through for the bare-single-atom
+                // case (exp == 1). `degC^2` is meaningless and we wouldn't
+                // want to auto-apply offsets to it anyway.
+                let atom = if *exp == 1 { Some(def) } else { None };
+                Ok(Resolved { unit, factor, atom })
             }
             UnitExpr::Mul(a, b) => {
-                let (ua, fa) = self.resolve(a)?;
-                let (ub, fb) = self.resolve(b)?;
-                Ok((ua.mul(&ub), fa * fb))
+                let ra = self.resolve(a)?;
+                let rb = self.resolve(b)?;
+                Ok(Resolved {
+                    unit: ra.unit.mul(&rb.unit),
+                    factor: ra.factor * rb.factor,
+                    atom: None,
+                })
             }
             UnitExpr::Div(a, b) => {
-                let (ua, fa) = self.resolve(a)?;
-                let (ub, fb) = self.resolve(b)?;
-                Ok((ua.div(&ub), fa / fb))
+                let ra = self.resolve(a)?;
+                let rb = self.resolve(b)?;
+                Ok(Resolved {
+                    unit: ra.unit.div(&rb.unit),
+                    factor: ra.factor / rb.factor,
+                    atom: None,
+                })
             }
         }
     }
@@ -253,9 +300,11 @@ mod tests {
     #[test]
     fn resolve_simple() {
         let reg = UnitRegistry::standard();
-        let (u, f) = reg.resolve(&UnitExpr::Atom("mile".into(), 1)).unwrap();
-        assert_eq!(u, Unit::METERS);
-        assert!((f - 1609.344).abs() < 1e-3, "got {}", f);
+        let r = reg.resolve(&UnitExpr::Atom("mile".into(), 1)).unwrap();
+        assert_eq!(r.unit, Unit::METERS);
+        assert!((r.factor - 1609.344).abs() < 1e-3, "got {}", r.factor);
+        assert!(r.atom.is_some());
+        assert!(!r.atom.unwrap().is_affine_temp);
     }
 
     #[test]
@@ -265,9 +314,10 @@ mod tests {
             Box::new(UnitExpr::Atom("mile".into(), 1)),
             Box::new(UnitExpr::Atom("hour".into(), 1)),
         );
-        let (u, f) = reg.resolve(&mph).unwrap();
-        assert_eq!(u, Unit { m: 1, s: -1, ..Unit::DIMENSIONLESS });
-        assert!((f - (1609.344 / 3600.0)).abs() < 1e-9);
+        let r = reg.resolve(&mph).unwrap();
+        assert_eq!(r.unit, Unit { m: 1, s: -1, ..Unit::DIMENSIONLESS });
+        assert!((r.factor - (1609.344 / 3600.0)).abs() < 1e-9);
+        assert!(r.atom.is_none(), "compound resolution carries no atom info");
     }
 
     #[test]
@@ -281,8 +331,18 @@ mod tests {
     fn prefix_expansion() {
         // kilometer = kilo + meter, even though we don't define "kilometer" directly.
         let reg = UnitRegistry::standard();
-        let (u, f) = reg.resolve(&UnitExpr::Atom("kilometer".into(), 1)).unwrap();
-        assert_eq!(u, Unit::METERS);
-        assert!((f - 1000.0).abs() < 1e-9);
+        let r = reg.resolve(&UnitExpr::Atom("kilometer".into(), 1)).unwrap();
+        assert_eq!(r.unit, Unit::METERS);
+        assert!((r.factor - 1000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn resolve_affine_temp() {
+        let reg = UnitRegistry::standard();
+        let r = reg.resolve(&UnitExpr::Atom("degC".into(), 1)).unwrap();
+        assert_eq!(r.unit, Unit::KELVIN);
+        let atom = r.atom.expect("single-atom resolution should carry atom info");
+        assert!(atom.is_affine_temp);
+        assert!((atom.offset - 273.15).abs() < 1e-9);
     }
 }

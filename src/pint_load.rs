@@ -1,10 +1,14 @@
 //! Loader for the bundled pint definition files (BSD-3-Clause, see
 //! data/PINT_LICENSE). At registry init we walk the files and register
 //! every prefix and atom we can resolve. Definitions we can't parse
-//! (offset units, contexts, system blocks, fractional dim powers)
-//! are silently skipped — better to drop a few atoms than refuse to boot.
+//! (contexts, system blocks, fractional dim powers) are silently
+//! skipped — better to drop a few atoms than refuse to boot.
+//!
+//! Affine temperature units (Celsius/Fahrenheit) are loaded with their
+//! offset metadata; eval applies the offset only when these atoms appear
+//! as bare single-atom literals.
 
-use crate::unit::{Unit, UnitRegistry};
+use crate::unit::{AtomDef, Unit, UnitRegistry};
 
 const DEFAULT_EN: &str = include_str!("../data/default_en.txt");
 const CONSTANTS_EN: &str = include_str!("../data/constants_en.txt");
@@ -13,9 +17,8 @@ impl UnitRegistry {
     pub(crate) fn load_pint_default(&mut self) {
         // Pint's actual layout: default_en.txt declares prefixes + base units,
         // then `@import constants_en.txt` mid-file, then derived units that
-        // reference both. To replicate without parsing the import directive,
-        // we make a few passes: each pass registers what it can, lines that
-        // failed get retried until no progress is made.
+        // reference both. We make a few passes: each pass registers what it
+        // can, lines that failed get retried until no progress is made.
         let mut last_count = 0;
         for _ in 0..10 {
             load_file(self, DEFAULT_EN);
@@ -27,15 +30,11 @@ impl UnitRegistry {
             last_count = count;
         }
         // Common composite aliases pint doesn't ship as atoms.
-        if let (Some((mu, mf)), Some((hu, hf))) =
-            (self.lookup_atom("mile"), self.lookup_atom("hour"))
-        {
-            self.add_atom("mph", mu.div(&hu), mf / hf);
+        if let (Some(m), Some(h)) = (self.lookup_atom("mile"), self.lookup_atom("hour")) {
+            self.add_atom("mph", m.unit.div(&h.unit), m.factor / h.factor);
         }
-        if let (Some((ku, kf)), Some((hu, hf))) =
-            (self.lookup_atom("kilometer"), self.lookup_atom("hour"))
-        {
-            self.add_atom("kph", ku.div(&hu), kf / hf);
+        if let (Some(km), Some(h)) = (self.lookup_atom("kilometer"), self.lookup_atom("hour")) {
+            self.add_atom("kph", km.unit.div(&h.unit), km.factor / h.factor);
         }
     }
 }
@@ -130,16 +129,11 @@ fn parse_definition(reg: &mut UnitRegistry, line: &str) -> Result<(), ()> {
         return Err(());
     }
 
-    // Strip `; offset: <n>` annotation. If the offset is non-zero, the unit
-    // is an affine temperature scale (celsius/fahrenheit/rankine) — our
-    // linear conversion model can't represent it. Register the names as
-    // intentionally excluded so the user gets a clear error rather than
-    // a silently-wrong answer.
-    let (body, offset_state) = strip_offset(body);
-    if matches!(offset_state, OffsetState::NonZero) {
-        mark_offset_excluded(reg, head, &aliases);
-        return Ok(());
-    }
+    // Pull off `; offset: <expr>` annotation. A non-zero offset means this
+    // is an affine temperature scale (Celsius/Fahrenheit). We register it
+    // with the offset baked into the AtomDef and mark `is_affine_temp = true`
+    // so eval can detect bare-atom literals at construction time.
+    let (body, offset) = strip_offset(reg, body);
 
     if body.starts_with('[') {
         let dim = body.trim();
@@ -154,76 +148,67 @@ fn parse_definition(reg: &mut UnitRegistry, line: &str) -> Result<(), ()> {
             "[]" => Unit::DIMENSIONLESS,
             _ => return Err(()),
         };
-        // pint's `gram = [mass] = g` quirk: gram is the mass base in pint, but
-        // our SI base is kg = 1000 g, so gram has factor 0.001.
         let factor = if head == "gram" { 0.001 } else { 1.0 };
-        add_with_plural(reg, head, unit, factor);
+        // Base-unit declarations don't normally have offsets; if one slips
+        // through (`kelvin = [temperature]; offset: 0`), treat it as linear.
+        let off = offset.unwrap_or(0.0);
+        let is_affine = unit == Unit::KELVIN && off != 0.0;
+        let def = AtomDef { unit, factor, offset: off, is_affine_temp: is_affine };
+        add_with_plural(reg, head, def);
         for alias in &aliases {
             if is_simple_ident(alias) {
-                add_with_plural(reg, alias, unit, factor);
+                add_with_plural(reg, alias, def);
             }
         }
         return Ok(());
     }
 
     let (unit, factor) = eval_pint_expr(reg, body)?;
-    add_with_plural(reg, head, unit, factor);
+    let off = offset.unwrap_or(0.0);
+    let is_affine = unit == Unit::KELVIN && off != 0.0;
+    let def = AtomDef { unit, factor, offset: off, is_affine_temp: is_affine };
+    add_with_plural(reg, head, def);
     for alias in &aliases {
         if is_simple_ident(alias) {
-            add_with_plural(reg, alias, unit, factor);
+            add_with_plural(reg, alias, def);
         }
     }
     Ok(())
 }
 
 /// Pint auto-pluralizes by adding `s`. Replicate that here so `miles`,
-/// `seconds`, `meters` all resolve.
-fn add_with_plural(reg: &mut UnitRegistry, name: &str, unit: Unit, factor: f64) {
-    reg.add_atom(name, unit, factor);
-    if !name.ends_with('s') {
-        reg.add_atom(&format!("{name}s"), unit, factor);
+/// `seconds`, `meters` all resolve. Skip short symbols (≤2 chars) to avoid
+/// nonsense aliases: pluralizing `m` (meter) → `ms` would shadow
+/// millisecond, `a` (year) → `as` would shadow attosecond, and so on.
+fn add_with_plural(reg: &mut UnitRegistry, name: &str, def: AtomDef) {
+    reg.add_atom_full(name, def);
+    if name.len() >= 3 && !name.ends_with('s') {
+        reg.add_atom_full(&format!("{name}s"), def);
     }
 }
 
-enum OffsetState {
-    None,
-    Zero,
-    NonZero,
-}
-
-/// Pull off pint's `; offset: <expr>` annotation. We only care about
-/// whether the offset is exactly zero (linear-equivalent, OK to register)
-/// or anything else (exclude). The actual value isn't useful since our
-/// conversion model can't represent affine units.
-fn strip_offset(body: &str) -> (&str, OffsetState) {
-    let Some(idx) = body.find(';') else { return (body, OffsetState::None) };
+/// Pull off pint's `; offset: <expr>` annotation. Tries to evaluate the
+/// offset expression (pint uses things like `233.15 + 200/9` for Fahrenheit)
+/// and returns the numeric Kelvin offset. Returns `None` when there's no
+/// annotation. Returns `Some(0.0)` for `; offset: 0` declarations.
+fn strip_offset<'a>(reg: &UnitRegistry, body: &'a str) -> (&'a str, Option<f64>) {
+    let Some(idx) = body.find(';') else { return (body, None) };
     let (left, right) = body.split_at(idx);
     let right = right[1..].trim();
     let Some(rest) = right.strip_prefix("offset:") else {
-        return (body, OffsetState::None);
+        return (body, None);
     };
     let rest = rest.trim();
-    let state = if rest == "0" || rest.parse::<f64>().map(|v| v == 0.0).unwrap_or(false) {
-        OffsetState::Zero
+    // Try a fast path for `0` or simple numbers; fall back to expr eval.
+    let value = if let Ok(n) = rest.parse::<f64>() {
+        n
     } else {
-        OffsetState::NonZero
-    };
-    (left.trim(), state)
-}
-
-fn mark_offset_excluded(reg: &mut UnitRegistry, head: &str, aliases: &[&str]) {
-    reg.add_excluded_offset(head);
-    if !head.ends_with('s') {
-        reg.add_excluded_offset(&format!("{head}s"));
-    }
-    for alias in aliases {
-        if is_simple_ident(alias) {
-            reg.add_excluded_offset(alias);
-            if !alias.ends_with('s') {
-                reg.add_excluded_offset(&format!("{alias}s"));
-            }
+        match eval_pint_expr(reg, rest) {
+            Ok((u, v)) if u.is_dimensionless() => v,
+            _ => return (left.trim(), None), // can't parse offset; skip
         }
-    }
+    };
+    (left.trim(), Some(value))
 }
 
 fn is_simple_ident(s: &str) -> bool {
@@ -460,8 +445,8 @@ fn parse_identifier(s: &mut State, reg: &UnitRegistry) -> Result<(Unit, f64), ()
     if name == "pi" || name == "π" {
         return Ok((Unit::DIMENSIONLESS, std::f64::consts::PI));
     }
-    if let Some(v) = reg.lookup_atom(name) {
-        return Ok(v);
+    if let Some(def) = reg.lookup_atom(name) {
+        return Ok((def.unit, def.factor));
     }
     Err(())
 }

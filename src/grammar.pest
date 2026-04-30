@@ -6,7 +6,7 @@ assignment  = { ident ~ "=" ~ expression }
 expression  = { conversion }
 
 conversion  = { addsub ~ (in_kw ~ unit_expr)? }
-in_kw       = @{ "in" ~ !(ASCII_ALPHANUMERIC | "_") }
+in_kw       = @{ ("in" | "as") ~ !(ASCII_ALPHANUMERIC | "_") }
 
 addsub      = { addsub_term ~ (add_op ~ addsub_term)* }
 add_op      = { "+" | "-" }

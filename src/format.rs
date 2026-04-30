@@ -11,19 +11,36 @@ pub fn format(answer: &Answer) -> String {
 }
 
 pub fn format_value(v: &Value) -> String {
-    // For pure-time values: HMS unless the user explicitly converted to a
-    // single non-second time atom like `hr` or `min`. Composite displays that
-    // happen to reduce to seconds (e.g. `miles*min/mile` from the canonical
-    // pace expression) are noise from arithmetic propagation, not intent.
-    let display_overrides_hms = v
-        .display
-        .as_ref()
-        .map(is_explicit_time_unit)
-        .unwrap_or(false);
-
-    if v.unit.is_pure_time() && v.mag.is_finite() && !display_overrides_hms {
-        return format_hms(v.mag);
+    // Pure-time formatting (unchanged). Temperature values have `unit == K`,
+    // so this branch doesn't fire for them.
+    //
+    // Reminder: this code branches on `unit.is_pure_time()` to detect TIME,
+    // not temperature. Temperature semantics are determined exclusively by
+    // `is_absolute_temp` / `render_as_delta` (see below).
+    if v.unit.is_pure_time() && v.mag.is_finite() {
+        if v.force_hms {
+            return format_hms(v.mag);
+        }
+        let display_overrides_hms = v.display_explicit
+            || v.display
+                .as_ref()
+                .map(is_explicit_time_unit)
+                .unwrap_or(false);
+        if !display_overrides_hms {
+            return format_hms(v.mag);
+        }
     }
+
+    // Temperature rendering — branches ONLY on `is_absolute_temp` and
+    // `render_as_delta`. Never on `unit` or atom names. The flags are
+    // the entire source of truth for whether this is a temperature value
+    // and how to format it.
+    if v.is_absolute_temp || v.render_as_delta {
+        if let Some(s) = render_temperature(v) {
+            return s;
+        }
+    }
+
     if let Some(rendered) = render_with_display(v) {
         return rendered;
     }
@@ -36,8 +53,6 @@ pub fn format_value(v: &Value) -> String {
 }
 
 fn is_explicit_time_unit(u: &UnitExpr) -> bool {
-    // A single atom with exponent 1 whose name is a non-second time unit.
-    // `s` is excluded so that `9:09 in s` still renders as HMS.
     matches!(
         u,
         UnitExpr::Atom(name, 1)
@@ -52,20 +67,72 @@ fn is_explicit_time_unit(u: &UnitExpr) -> bool {
     )
 }
 
+/// Render a value carrying a temperature flag (`is_absolute_temp` or
+/// `render_as_delta`). Returns `None` if the display hint doesn't
+/// dimensionally match (we shouldn't see this in practice — eval guards
+/// against it — but the formatter is defensive).
+fn render_temperature(v: &Value) -> Option<String> {
+    let display = v.display.as_ref()?;
+    let registry = UnitRegistry::standard();
+    let r = registry.resolve(display).ok()?;
+    if r.unit != v.unit {
+        return None;
+    }
+    if r.factor == 0.0 || !r.factor.is_finite() {
+        return None;
+    }
+    // For single-atom displays the resolver hands us the AtomDef so we can
+    // tell affine from linear. Compound display targets render as plain
+    // scaled values (no Δ marker, no offset application).
+    let atom = r.atom;
+
+    if v.is_absolute_temp {
+        // Absolute reading. Apply the affine inverse for affine displays;
+        // for non-affine displays (K, compound), just scale by factor.
+        let offset = atom.map(|a| if a.is_affine_temp { a.offset } else { 0.0 }).unwrap_or(0.0);
+        let display_mag = (v.mag - offset) / r.factor;
+        let unit_str = render_unit_expr(display);
+        return Some(format_with_unit(display_mag, &unit_str));
+    }
+
+    if v.render_as_delta {
+        let display_mag = v.mag / r.factor;
+        let unit_str = render_unit_expr(display);
+        // Δ marker only when displaying a delta in an AFFINE temperature unit
+        // (degC/degF). K and other linear units don't get a marker — K is the
+        // canonical delta unit and a plain "5 K" is unambiguous.
+        let mark_delta = atom.map(|a| a.is_affine_temp).unwrap_or(false);
+        if mark_delta {
+            return Some(format!("{} Δ{}", trim_float(display_mag), unit_str));
+        }
+        return Some(format_with_unit(display_mag, &unit_str));
+    }
+
+    None
+}
+
+fn format_with_unit(mag: f64, unit_str: &str) -> String {
+    let m = trim_float(mag);
+    if unit_str.is_empty() {
+        m
+    } else {
+        format!("{m} {unit_str}")
+    }
+}
+
 /// Try to render in the value's preferred display unit. Returns None if the
-/// hint doesn't resolve, doesn't dimensionally match the value, or simplifies
-/// to dimensionless (in which case base-unit rendering is clearer).
+/// hint doesn't resolve, doesn't dimensionally match, or has zero factor.
 fn render_with_display(v: &Value) -> Option<String> {
     let display = v.display.as_ref()?;
     let registry = UnitRegistry::standard();
-    let (display_unit, factor) = registry.resolve(display).ok()?;
-    if display_unit != v.unit {
+    let r = registry.resolve(display).ok()?;
+    if r.unit != v.unit {
         return None;
     }
-    if factor == 0.0 || !factor.is_finite() {
+    if r.factor == 0.0 || !r.factor.is_finite() {
         return None;
     }
-    let mag = trim_float(v.mag / factor);
+    let mag = trim_float(v.mag / r.factor);
     let unit_str = render_unit_expr(display);
     if unit_str.is_empty() {
         Some(mag)
@@ -131,7 +198,6 @@ fn trim_float(x: f64) -> String {
     if x == x.trunc() && x.abs() < 1e16 {
         format!("{}", x as i64)
     } else {
-        // Show up to 6 significant decimal places, trimming trailing zeros.
         let s = format!("{x:.6}");
         let trimmed = s.trim_end_matches('0').trim_end_matches('.');
         trimmed.to_string()
