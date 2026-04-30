@@ -33,6 +33,15 @@ impl Env {
     pub fn set(&mut self, name: &str, value: Value) {
         self.vars.insert(name.to_ascii_lowercase(), value);
     }
+
+    /// Drop user bindings and re-bind `Ans = 0`. The unit registry is left
+    /// intact — this is the cheap path for "recompute the whole notebook"
+    /// frontends that want a fresh env on every render but can't afford the
+    /// pint loader's multi-pass cost.
+    pub fn reset(&mut self) {
+        self.vars.clear();
+        self.set("Ans", Value::dimensionless(0.0));
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +57,13 @@ pub struct Engine {
 impl Engine {
     pub fn new() -> Self {
         Engine { env: Env::new() }
+    }
+
+    /// Cheap state reset: clears user bindings and resets `Ans`, but keeps
+    /// the (expensive) unit registry. Use this when re-evaluating from
+    /// scratch on every edit (e.g. notebook frontends).
+    pub fn reset(&mut self) {
+        self.env.reset();
     }
 
     pub fn eval(&mut self, input: &str) -> Result<Answer, Error> {
@@ -357,6 +373,18 @@ mod tests {
         // Ans is itself case-insensitive.
         let r = eng.eval("ANS + 50 m").unwrap();
         assert_eq!(crate::format::format(&r), "150 m");
+    }
+
+    #[test]
+    fn reset_clears_vars_keeps_registry() {
+        let mut eng = Engine::new();
+        eng.eval("x = 42 mph").unwrap();
+        eng.eval("y = x * 2").unwrap();
+        eng.reset();
+        assert!(matches!(eng.eval("x"), Err(Error::UndefinedVar(_))));
+        assert_eq!(crate::format::format(&eng.eval("Ans").unwrap()), "0");
+        // Registry survived (mph still resolves, no rebuild needed).
+        assert!(eng.eval("1 mph").is_ok());
     }
 
     #[test]
