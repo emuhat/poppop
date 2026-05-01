@@ -25,7 +25,7 @@ pow_exp     = { neg_op? ~ atom }
 
 atom        = { date_literal | time_with_unit | number | call | var | paren }
 paren       = { "(" ~ expression ~ ")" }
-call        = { ident ~ "(" ~ expression ~ ("," ~ expression)* ~ ")" }
+call        = { ident ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }
 var         = { ident }
 time_with_unit   = { time_literal ~ unit_expr? }
 

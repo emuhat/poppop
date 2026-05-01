@@ -1,8 +1,57 @@
+use crate::calendar;
 use crate::error::Error;
 use crate::unit::Unit;
 use crate::value::{LinearValue, Value};
 
 pub fn call(name: &str, args: Vec<Value>) -> Result<Value, Error> {
+    // Time-domain builtins go first — they accept Instant/Period inputs
+    // (or none at all), so they can't go through the LinearValue extraction.
+    match name {
+        "now" => {
+            check_arity_value(name, &args, 0)?;
+            return Ok(Value::Instant(calendar::now()));
+        }
+        "today" => {
+            check_arity_value(name, &args, 0)?;
+            return Ok(Value::Instant(calendar::today()));
+        }
+        "as_duration" => {
+            // as_duration(period, anchor) → Linear seconds.
+            check_arity_value(name, &args, 2)?;
+            let period = match &args[0] {
+                Value::Period(p) => p.clone(),
+                _ => return Err(Error::TimeArithmetic(
+                    "as_duration: first arg must be a period".to_string(),
+                )),
+            };
+            let anchor = match &args[1] {
+                Value::Instant(i) => i.clone(),
+                _ => return Err(Error::TimeArithmetic(
+                    "as_duration: second arg must be an instant anchor".to_string(),
+                )),
+            };
+            return calendar::as_duration(period, anchor).map(Value::Linear);
+        }
+        "as_period" => {
+            // as_period(duration, anchor) → Period.
+            check_arity_value(name, &args, 2)?;
+            let duration = match &args[0] {
+                Value::Linear(l) => l.clone(),
+                _ => return Err(Error::TimeArithmetic(
+                    "as_period: first arg must be a duration".to_string(),
+                )),
+            };
+            let anchor = match &args[1] {
+                Value::Instant(i) => i.clone(),
+                _ => return Err(Error::TimeArithmetic(
+                    "as_period: second arg must be an instant anchor".to_string(),
+                )),
+            };
+            return calendar::as_period(duration, anchor).map(Value::Period);
+        }
+        _ => {}
+    }
+
     // sqrt/abs/min/max only operate on linear scalar values. Reject Instant
     // and Period inputs with a clear error.
     let args: Vec<LinearValue> = args
@@ -75,6 +124,17 @@ pub fn call(name: &str, args: Vec<Value>) -> Result<Value, Error> {
 }
 
 fn check_arity(name: &str, args: &[LinearValue], expected: usize) -> Result<(), Error> {
+    if args.len() != expected {
+        return Err(Error::Arity {
+            name: name.to_string(),
+            expected,
+            got: args.len(),
+        });
+    }
+    Ok(())
+}
+
+fn check_arity_value(name: &str, args: &[Value], expected: usize) -> Result<(), Error> {
     if args.len() != expected {
         return Err(Error::Arity {
             name: name.to_string(),

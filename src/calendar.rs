@@ -1,7 +1,7 @@
 //! Thin wrapper over `chrono` for date/time/period arithmetic. Keeps
 //! the rest of the engine free of `chrono::*` types.
 
-use chrono::{Days, Months, NaiveDate, NaiveTime};
+use chrono::{Datelike, Days, Months, NaiveDate, NaiveTime, Utc};
 
 use crate::error::Error;
 use crate::unit::Unit;
@@ -34,10 +34,61 @@ pub fn instant_minus_duration(i: InstantValue, l: LinearValue) -> Result<Instant
     Ok(InstantValue { timestamp: new_ts })
 }
 
+/// Per the v2 spec, `Instant - Instant` returns a Period — the calendar
+/// decomposition of the difference into (years, months, days). No
+/// normalization: components can be negative and don't borrow across
+/// boundaries, so the result is fully determined by component-wise
+/// subtraction.
+///
+/// Round-trip note: `a + (a - b)` is NOT guaranteed to equal `a` in general
+/// because Period application clamps end-of-month overflow (Jan 31 + 1mo →
+/// Feb 28). The spec accepts this non-invertibility.
 pub fn instant_minus_instant(a: InstantValue, b: InstantValue) -> Value {
+    let years = a.timestamp.year() - b.timestamp.year();
+    let months = a.timestamp.month() as i32 - b.timestamp.month() as i32;
+    let days = a.timestamp.day() as i32 - b.timestamp.day() as i32;
+    Value::Period(PeriodValue { years, months, days })
+}
+
+/// Used by `as_duration` to compute the *exact seconds* between two
+/// instants (not the Period decomposition). Returns a Linear value
+/// with `unit = SECONDS`.
+fn instant_diff_seconds(a: InstantValue, b: InstantValue) -> LinearValue {
     let diff = a.timestamp - b.timestamp;
     let secs = diff.num_seconds() as f64 + (diff.subsec_nanos() as f64) / 1e9;
-    Value::Linear(LinearValue::new(secs, Unit::SECONDS))
+    LinearValue::new(secs, Unit::SECONDS)
+}
+
+// ─── v2 builtins ───────────────────────────────────────────────────────────
+
+pub fn now() -> InstantValue {
+    InstantValue { timestamp: Utc::now().naive_utc() }
+}
+
+pub fn today() -> InstantValue {
+    let date = Utc::now().naive_utc().date();
+    InstantValue { timestamp: date.and_time(NaiveTime::MIN) }
+}
+
+/// `as_duration(period, anchor)` — apply the period to the anchor instant
+/// and return the seconds between the two instants. Anchor is required
+/// because months/years have varying lengths.
+pub fn as_duration(p: PeriodValue, anchor: InstantValue) -> Result<LinearValue, Error> {
+    let after = apply_period(anchor.clone(), p, 1)?;
+    Ok(instant_diff_seconds(after, anchor))
+}
+
+/// `as_period(duration, anchor)` — apply the linear duration to the
+/// anchor and return the calendar decomposition of the resulting span.
+/// Anchor is required because the same number of seconds spans different
+/// numbers of calendar months/days depending on where it starts.
+pub fn as_period(l: LinearValue, anchor: InstantValue) -> Result<PeriodValue, Error> {
+    require_seconds(&l)?;
+    let after = instant_plus_duration(anchor.clone(), l)?;
+    let years = after.timestamp.year() - anchor.timestamp.year();
+    let months = after.timestamp.month() as i32 - anchor.timestamp.month() as i32;
+    let days = after.timestamp.day() as i32 - anchor.timestamp.day() as i32;
+    Ok(PeriodValue { years, months, days })
 }
 
 pub fn instant_plus_period(i: InstantValue, p: PeriodValue) -> Result<InstantValue, Error> {

@@ -114,7 +114,16 @@ fn format_with_unit(mag: f64, unit_str: &str) -> String {
 fn render_with_display(v: &LinearValue) -> Option<String> {
     let display = v.display.as_ref()?;
     let registry = UnitRegistry::standard();
-    let r = registry.resolve(display).ok()?;
+
+    // Try simplifying first. Arithmetic propagates display as a Mul/Div
+    // tree of operand displays; for `time / pace` (= `hours / (mins/mile)`)
+    // the time atoms cancel, leaving just `mile` as the surviving display.
+    // Without this pass the user sees `0.3 hours/mins/mile` instead of
+    // `18 mile`.
+    let simplified = simplify_display(display, &registry);
+    let to_use: &UnitExpr = simplified.as_ref().unwrap_or(display);
+
+    let r = registry.resolve(to_use).ok()?;
     if r.unit != v.unit {
         return None;
     }
@@ -122,11 +131,107 @@ fn render_with_display(v: &LinearValue) -> Option<String> {
         return None;
     }
     let mag = trim_float(v.mag / r.factor);
-    let unit_str = render_unit_expr(display);
+    let unit_str = render_unit_expr(to_use);
     if unit_str.is_empty() {
         Some(mag)
     } else {
         Some(format!("{mag} {unit_str}"))
+    }
+}
+
+/// If the display tree has atoms that cancel along a base dimension (e.g.
+/// `hours` and `mins` both contributing to time with net exponent zero),
+/// return a reduced UnitExpr with those atoms dropped. Their factor
+/// contribution stays implicitly via the resolution path.
+///
+/// Returns `None` when no simplification is possible.
+fn simplify_display(display: &UnitExpr, registry: &UnitRegistry) -> Option<UnitExpr> {
+    use std::collections::HashMap;
+
+    let mut occurrences: Vec<(String, i32)> = Vec::new();
+    collect_atoms(display, 1, &mut occurrences);
+
+    // Aggregate same-named atoms.
+    let mut by_name: HashMap<String, i32> = HashMap::new();
+    for (name, exp) in occurrences {
+        *by_name.entry(name).or_insert(0) += exp;
+    }
+    by_name.retain(|_, exp| *exp != 0);
+
+    // Group by base dimension. Drop a group when (a) it has more than one
+    // distinct atom and (b) its total exponent sums to 0 — that's the
+    // "fully canceled" case where the atoms exist only as a constant
+    // factor. Mixed groups with non-zero net (e.g. mile²/foot) are kept
+    // intact so user intent isn't erased.
+    let mut by_dim: HashMap<crate::unit::Unit, Vec<(String, i32)>> = HashMap::new();
+    for (name, exp) in &by_name {
+        let def = registry.lookup_atom(name)?;
+        by_dim.entry(def.unit).or_default().push((name.clone(), *exp));
+    }
+
+    let mut surviving: Vec<(String, i32)> = Vec::new();
+    for (_, group) in by_dim {
+        let net: i32 = group.iter().map(|(_, e)| *e).sum();
+        if net == 0 && group.len() > 1 {
+            continue;
+        }
+        surviving.extend(group);
+    }
+
+    if surviving.is_empty() {
+        // All atoms cancelled — display is dimensionless. Caller will
+        // fall through to base-unit (empty) rendering.
+        return None;
+    }
+
+    // Always reconstruct in canonical numer/denom form, even when nothing
+    // cancelled. `5 km / (mins/mile)` produces a display of
+    // `km / (mins/mile)` which renders as `km/mins/mile` (ambiguous);
+    // canonicalizing flattens it to `km*mile/mins` for clarity.
+
+    // Sort: positives first, then negatives, alphabetical within. Builds
+    // tidy `mile` or `m^2/s` rather than `s^-1*m^2`.
+    surviving.sort_by(|a, b| b.1.signum().cmp(&a.1.signum()).then(a.0.cmp(&b.0)));
+
+    // Reconstruct as a Div(numer, denom) tree where possible — render
+    // as "mile" or "m^2/s" rather than "m^2*s^-1".
+    let (positives, negatives): (Vec<_>, Vec<_>) =
+        surviving.into_iter().partition(|(_, e)| *e > 0);
+
+    fn build_mul(items: Vec<(String, i32)>) -> Option<UnitExpr> {
+        let mut iter = items.into_iter();
+        let (n, e) = iter.next()?;
+        let mut acc = UnitExpr::Atom(n, e.abs());
+        for (n, e) in iter {
+            acc = UnitExpr::Mul(Box::new(acc), Box::new(UnitExpr::Atom(n, e.abs())));
+        }
+        Some(acc)
+    }
+
+    let numer = build_mul(positives);
+    let denom = build_mul(negatives);
+    match (numer, denom) {
+        (Some(n), None) => Some(n),
+        (Some(n), Some(d)) => Some(UnitExpr::Div(Box::new(n), Box::new(d))),
+        (None, Some(d)) => Some(UnitExpr::Div(
+            Box::new(UnitExpr::Atom("1".to_string(), 0)),
+            Box::new(d),
+        )),
+        (None, None) => None,
+    }
+}
+
+fn collect_atoms(u: &UnitExpr, sign: i32, out: &mut Vec<(String, i32)>) {
+    match u {
+        UnitExpr::Atom(name, exp) => out.push((name.clone(), exp * sign)),
+        UnitExpr::Mul(a, b) => {
+            collect_atoms(a, sign, out);
+            collect_atoms(b, sign, out);
+        }
+        UnitExpr::Div(a, b) => {
+            collect_atoms(a, sign, out);
+            collect_atoms(b, -sign, out);
+        }
     }
 }
 

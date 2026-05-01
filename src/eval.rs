@@ -454,8 +454,10 @@ fn pow_linear(la: LinearValue, lb: LinearValue) -> Result<Value, Error> {
 
 fn convert_value(env: &mut Env, inner: &Expr, target: &UnitExpr) -> Result<Value, Error> {
     let v = eval_expr(env, inner)?;
-    // Most conversions only apply to linear values. Instants and Periods get
-    // a clear error in v1 (no anchored period↔duration conversion yet).
+    // Most conversions only apply to linear values. Instants get a clear
+    // error. Periods are convertible without an anchor *only* if they
+    // contain just days (no months or years) — every day is exactly 86400 s,
+    // so the conversion is unambiguous. Mixed periods need `as_duration`.
     let l = match v {
         Value::Linear(l) => l,
         Value::Instant(_) => {
@@ -463,10 +465,19 @@ fn convert_value(env: &mut Env, inner: &Expr, target: &UnitExpr) -> Result<Value
                 "cannot convert an instant via `in`".to_string(),
             ));
         }
-        Value::Period(_) => {
-            return Err(Error::TimeArithmetic(
-                "cannot convert a period to a unit (no anchor)".to_string(),
-            ));
+        Value::Period(p) => {
+            if p.years != 0 || p.months != 0 {
+                return Err(Error::TimeArithmetic(
+                    "cannot convert a period containing months or years without an anchor — \
+                     use `as_duration(period, anchor)` instead"
+                        .to_string(),
+                ));
+            }
+            // Days-only period: 1 day = 86400 s, no ambiguity. Lower to a
+            // Linear duration, then continue through the normal conversion
+            // path so e.g. `(2026-05-03 - today()) in days` ends up as
+            // "2 days" Linear.
+            LinearValue::new(p.days as f64 * 86400.0, Unit::SECONDS)
         }
     };
 
@@ -950,11 +961,22 @@ mod tests {
     }
 
     #[test]
-    fn date_minus_date_yields_duration() {
-        // The Linear result has unit=SECONDS, so HMS auto-format kicks in.
-        assert_eq!(fmt("2026-04-30 - 2026-04-29"), "24:00:00.00");
-        // User can convert to plain seconds:
-        assert_eq!(fmt("(2026-04-30 - 2026-04-29) in seconds"), "86400 seconds");
+    fn date_minus_date_yields_period() {
+        // v2: Instant - Instant returns a Period via component-wise calendar
+        // decomposition (years, months, days). NOT a Linear duration.
+        assert_eq!(fmt("2026-04-30 - 2026-04-29"), "P1D");
+        assert_eq!(fmt("2026-12-31 - 2026-01-01"), "P11M30D");
+        // To get exact seconds, use as_duration with an anchor.
+        // Result is Linear seconds, HMS auto-rendered as 24:00:00.00 for 1 day.
+        assert_eq!(
+            fmt("as_duration(2026-04-30 - 2026-04-29, 2026-04-29)"),
+            "24:00:00.00"
+        );
+        // Or convert to plain seconds.
+        assert_eq!(
+            fmt("as_duration(2026-04-30 - 2026-04-29, 2026-04-29) in seconds"),
+            "86400 seconds"
+        );
     }
 
     #[test]
@@ -1063,8 +1085,8 @@ mod tests {
 
     #[test]
     fn date_arith_round_trip() {
-        // (Feb 28) - (Feb 28) = 0 seconds, HMS format for <60s is "0.00".
-        assert_eq!(fmt("(2026-01-31 + 1 month) - (2026-01-31 + 1 month)"), "0.00");
+        // (Feb 28) - (Feb 28) = empty Period under v2 (Instant-Instant→Period).
+        assert_eq!(fmt("(2026-01-31 + 1 month) - (2026-01-31 + 1 month)"), "P0D");
     }
 
     #[test]
@@ -1150,5 +1172,140 @@ mod tests {
         let mut eng = Engine::new();
         assert!(matches!(eng.eval("sqrt(2026-04-30)"), Err(Error::TimeArithmetic(_))));
         assert!(matches!(eng.eval("sqrt(1 month)"), Err(Error::TimeArithmetic(_))));
+    }
+
+    // ─── v2 builtins ───────────────────────────────────────────────────────
+
+    #[test]
+    fn now_returns_instant() {
+        let v = eval_str("now()");
+        assert!(v.is_instant(), "now() must return Instant, got {v:?}");
+    }
+
+    #[test]
+    fn today_returns_midnight_instant() {
+        let v = eval_str("today()");
+        let i = v.as_instant().expect("today() must return Instant");
+        assert_eq!(i.timestamp.time(), chrono::NaiveTime::MIN);
+    }
+
+    #[test]
+    fn now_arithmetic() {
+        // Should be able to add a duration to now() without erroring.
+        let mut eng = Engine::new();
+        assert!(eng.eval("now() + 1 hour").is_ok());
+        // And a period.
+        assert!(eng.eval("today() + 1 month").is_ok());
+    }
+
+    #[test]
+    fn as_duration_with_anchor() {
+        // 1 month from Jan 1 = 31 days = 2_678_400 seconds.
+        let r = eval_str("as_duration(1 month, 2026-01-01)");
+        let l = r.as_linear().expect("as_duration → Linear");
+        assert!((l.mag - 31.0 * 86400.0).abs() < 1e-3, "got mag {}", l.mag);
+        assert_eq!(l.unit, Unit::SECONDS);
+        // 1 month from Feb 1 = 28 days (2026 isn't leap year).
+        let r = eval_str("as_duration(1 month, 2026-02-01)");
+        let l = r.as_linear().unwrap();
+        assert!((l.mag - 28.0 * 86400.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn as_period_with_anchor() {
+        // 31 days starting Jan 1 → P1M (the calendar month from Jan 1 to Feb 1).
+        // 86400 * 31 = 2_678_400 seconds.
+        let r = eval_str("as_period(2678400 seconds, 2026-01-01)");
+        let p = r.as_period().expect("as_period → Period");
+        assert_eq!(p.months, 1);
+        assert_eq!(p.days, 0);
+        assert_eq!(p.years, 0);
+    }
+
+    #[test]
+    fn as_duration_rejects_wrong_args() {
+        let mut eng = Engine::new();
+        // First arg must be Period.
+        assert!(matches!(
+            eng.eval("as_duration(5 hours, 2026-01-01)"),
+            Err(Error::TimeArithmetic(_))
+        ));
+        // Second arg must be Instant.
+        assert!(matches!(
+            eng.eval("as_duration(1 month, 5 hours)"),
+            Err(Error::TimeArithmetic(_))
+        ));
+    }
+
+    #[test]
+    fn instant_minus_instant_is_period_not_linear() {
+        // The v2 invariant: Instant - Instant stays in the calendar domain.
+        let v = eval_str("2026-04-30 - 2026-04-29");
+        assert!(v.is_period(), "got {v:?}");
+        let p = v.as_period().unwrap();
+        assert_eq!(*p, PeriodValue { years: 0, months: 0, days: 1 });
+    }
+
+    #[test]
+    fn days_only_period_converts_without_anchor() {
+        // `(2026-05-03 - 2026-05-01) in days` works because the resulting
+        // period contains only days — no ambiguity, every day is 86400 s.
+        assert_eq!(fmt("(2026-05-03 - 2026-05-01) in days"), "2 days");
+        assert_eq!(fmt("(2026-05-03 - 2026-05-01) in hours"), "48 hours");
+        assert_eq!(fmt("(2026-05-03 - 2026-05-01) in seconds"), "172800 seconds");
+        // Through cal_days literal too.
+        assert_eq!(fmt("5 cal_days in days"), "5 days");
+        // Months/years still require an anchor; clearer error pointing at
+        // as_duration.
+        let err = fmt_err("1 month in days");
+        let msg = format!("{err}");
+        assert!(msg.contains("anchor"), "got {msg}");
+        assert!(msg.contains("as_duration"), "got {msg}");
+    }
+
+    #[test]
+    fn display_simplifies_when_atoms_cancel() {
+        // `time / pace` propagates display = `hours/(mins/mile)`. The
+        // time atoms cancel out, leaving just `mile` as the surviving
+        // dimension. Without simplification the user sees the ugly
+        // `0.3 hours/mins/mile`.
+        let mut eng = Engine::new();
+        eng.eval("pace = 10 mins/mile").unwrap();
+        eng.eval("time = 3 hours").unwrap();
+        let r = eng.eval("time / pace").unwrap();
+        assert_eq!(crate::format::format(&r), "18 mile");
+    }
+
+    #[test]
+    fn display_canonicalizes_compound_units() {
+        // `5 km / pace` doesn't have any cancelling atoms, but the display
+        // tree (Div(km, Div(mins, mile))) renders ambiguously as
+        // "km/mins/mile". Canonicalization flattens to numerator/denom
+        // form for clarity.
+        let mut eng = Engine::new();
+        eng.eval("pace = 10 mins/mile").unwrap();
+        let s = crate::format::format(&eng.eval("5 km / pace").unwrap());
+        assert!(s.contains("km*mile/mins"), "got {s}");
+    }
+
+    #[test]
+    fn display_keeps_simple_compound() {
+        // Don't break clean compound displays like m/s.
+        assert_eq!(fmt("(10 m) / (5 s)"), "2 m/s");
+    }
+
+    #[test]
+    fn period_round_trip_through_anchor() {
+        // P1M from Jan 1 anchor → 31 days exact → back to P1M.
+        let mut eng = Engine::new();
+        eng.eval("anchor = 2026-01-01").unwrap();
+        eng.eval("d = as_duration(1 month, anchor)").unwrap();
+        let answer = eng.eval("as_period(d, anchor)").unwrap();
+        let value = match answer {
+            Answer::Bare(v) => v,
+            Answer::Assigned { value, .. } => value,
+        };
+        let p = value.as_period().unwrap();
+        assert_eq!(p.months, 1);
     }
 }
