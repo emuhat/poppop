@@ -198,6 +198,11 @@ pub struct UnitRegistry {
     /// SI prefixes loaded from pint. Keyed by the full prefix word ("kilo")
     /// AND the symbol form ("k"). Value is the multiplier.
     prefixes: HashMap<String, f64>,
+    /// Maps each registered atom name (head, aliases, plurals) to its
+    /// canonical full name — the head of the pint definition. Used by the
+    /// formatter to expand abbreviated symbols on output (`N` → `newton`,
+    /// `T` → `tesla`). Aliases that ARE the head map to themselves.
+    canonical_names: HashMap<String, String>,
 }
 
 impl UnitRegistry {
@@ -205,7 +210,21 @@ impl UnitRegistry {
         UnitRegistry {
             atoms: HashMap::new(),
             prefixes: HashMap::new(),
+            canonical_names: HashMap::new(),
         }
+    }
+
+    /// Record that `alias` points to `canonical` for display purposes.
+    pub fn set_canonical(&mut self, alias: &str, canonical: &str) {
+        self.canonical_names
+            .insert(alias.to_string(), canonical.to_string());
+    }
+
+    /// Look up the canonical (full) name for an atom alias. Returns
+    /// `None` if no mapping is registered. The formatter uses this to
+    /// expand single-letter symbols (`N` → `newton`) on output.
+    pub fn canonical_name(&self, alias: &str) -> Option<&str> {
+        self.canonical_names.get(alias).map(|s| s.as_str())
     }
 
     pub fn standard() -> Self {
@@ -233,18 +252,44 @@ impl UnitRegistry {
     }
 
     pub fn lookup_atom(&self, name: &str) -> Option<AtomDef> {
+        // 1. Exact case-sensitive atom hit. Preserves the K-vs-k and S-vs-s
+        // distinctions that matter in SI.
         if let Some(def) = self.atoms.get(name) {
             return Some(*def);
         }
-        // Try prefix expansion: if the name starts with a known prefix and the
-        // remainder is an atom, combine them. Longer prefix matches first.
-        // Prefixed lookups never produce affine units (offset is zero there
-        // by construction — pint's affine atoms aren't prefixable anyway).
+        // 2. Case-sensitive prefix expansion (kilo + meter = kilometer, etc.).
+        // Prefixed lookups never produce affine units.
+        if let Some(def) = self.try_prefix_expansion(name, false) {
+            return Some(def);
+        }
+        // 3. Case-insensitive atom fallback. Lets users type `degf` for
+        // `degF` or `Miles` for `miles` without exact-case discipline.
+        // Only fires when steps 1 and 2 didn't resolve, so existing
+        // case-sensitive behavior is preserved.
+        if let Some(def) = self.case_insensitive_atom(name) {
+            return Some(def);
+        }
+        // 4. Case-insensitive prefix expansion. Handles `KM` → kilometer,
+        // `MI/HR` → mile/hour. Trade-off: `M`/`m` collide (mega vs milli)
+        // when lowercased; whichever was registered first in pint wins.
+        // Users still get exact-case prefix behavior because step 2 hits
+        // first when it matches.
+        self.try_prefix_expansion(name, true)
+    }
+
+    fn try_prefix_expansion(&self, name: &str, case_insensitive: bool) -> Option<AtomDef> {
+        let target = if case_insensitive { name.to_lowercase() } else { name.to_string() };
         let mut keys: Vec<&String> = self.prefixes.keys().collect();
         keys.sort_by(|a, b| b.len().cmp(&a.len()));
         for prefix in keys {
-            if let Some(rest) = name.strip_prefix(prefix.as_str()) {
-                if let Some(def) = self.atoms.get(rest) {
+            let p = if case_insensitive { prefix.to_lowercase() } else { prefix.clone() };
+            if let Some(rest) = target.strip_prefix(p.as_str()) {
+                let atom_def = if case_insensitive {
+                    self.atoms.get(rest).copied().or_else(|| self.case_insensitive_atom(rest))
+                } else {
+                    self.atoms.get(rest).copied()
+                };
+                if let Some(def) = atom_def {
                     let scale = self.prefixes[prefix];
                     return Some(AtomDef {
                         unit: def.unit,
@@ -253,6 +298,16 @@ impl UnitRegistry {
                         kind: AtomKind::Linear,
                     });
                 }
+            }
+        }
+        None
+    }
+
+    fn case_insensitive_atom(&self, name: &str) -> Option<AtomDef> {
+        let lower = name.to_lowercase();
+        for (k, def) in &self.atoms {
+            if k.to_lowercase() == lower {
+                return Some(*def);
             }
         }
         None

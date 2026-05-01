@@ -86,13 +86,13 @@ fn render_temperature(v: &LinearValue) -> Option<String> {
     if v.is_absolute_temp {
         let offset = if is_affine { atom.unwrap().offset } else { 0.0 };
         let display_mag = (v.mag - offset) / r.factor;
-        let unit_str = render_unit_expr(display);
+        let unit_str = render_unit_expr(display, &registry);
         return Some(format_with_unit(display_mag, &unit_str));
     }
 
     if v.render_as_delta {
         let display_mag = v.mag / r.factor;
-        let unit_str = render_unit_expr(display);
+        let unit_str = render_unit_expr(display, &registry);
         if is_affine {
             return Some(format!("{} Δ{}", trim_float(display_mag), unit_str));
         }
@@ -131,7 +131,7 @@ fn render_with_display(v: &LinearValue) -> Option<String> {
         return None;
     }
     let mag = trim_float(v.mag / r.factor);
-    let unit_str = render_unit_expr(to_use);
+    let unit_str = render_unit_expr(to_use, &registry);
     if unit_str.is_empty() {
         Some(mag)
     } else {
@@ -235,16 +235,40 @@ fn collect_atoms(u: &UnitExpr, sign: i32, out: &mut Vec<(String, i32)>) {
     }
 }
 
-fn render_unit_expr(u: &UnitExpr) -> String {
+fn render_unit_expr(u: &UnitExpr, reg: &UnitRegistry) -> String {
     match u {
-        UnitExpr::Atom(name, exp) => match *exp {
-            0 => String::new(),
-            1 => name.clone(),
-            n => format!("{name}^{n}"),
-        },
+        UnitExpr::Atom(name, exp) => {
+            // Expand single uppercase-letter SI symbols to their canonical
+            // names so the user can read `10 T` as `10 tesla` instead of
+            // squinting at the ambiguous letter. The narrow rule keeps
+            // already-readable forms intact:
+            //   * `T`/`N`/`J`/`K` → tesla/newton/joule/kelvin (expanded)
+            //   * `m`/`s`/`g` (lowercase) → kept (universal SI base symbols)
+            //   * `Hz`/`Pa`/`kg`/`hr` (multi-char) → kept
+            //   * `mile`/`seconds`/`degC` (already a word) → kept
+            //   * canonical names with underscores (`degree_Celsius`,
+            //     `light_year`) → never used; keep the typed form
+            let canonical = reg.canonical_name(name);
+            let should_swap = name.chars().count() == 1
+                && name.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false)
+                && canonical.is_some()
+                && canonical.unwrap() != name
+                && !canonical.unwrap().contains('_')
+                && canonical.unwrap().chars().count() >= 3;
+            let display_name = if should_swap {
+                canonical.unwrap()
+            } else {
+                name.as_str()
+            };
+            match *exp {
+                0 => String::new(),
+                1 => display_name.to_string(),
+                n => format!("{display_name}^{n}"),
+            }
+        }
         UnitExpr::Mul(a, b) => {
-            let ra = render_unit_expr(a);
-            let rb = render_unit_expr(b);
+            let ra = render_unit_expr(a, reg);
+            let rb = render_unit_expr(b, reg);
             match (ra.is_empty(), rb.is_empty()) {
                 (true, _) => rb,
                 (_, true) => ra,
@@ -252,8 +276,8 @@ fn render_unit_expr(u: &UnitExpr) -> String {
             }
         }
         UnitExpr::Div(a, b) => {
-            let ra = render_unit_expr(a);
-            let rb = render_unit_expr(b);
+            let ra = render_unit_expr(a, reg);
+            let rb = render_unit_expr(b, reg);
             match (ra.is_empty(), rb.is_empty()) {
                 (true, true) => String::new(),
                 (true, _) => format!("1/{rb}"),

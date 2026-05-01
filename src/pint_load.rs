@@ -32,9 +32,11 @@ impl UnitRegistry {
         // Common composite aliases pint doesn't ship as atoms.
         if let (Some(m), Some(h)) = (self.lookup_atom("mile"), self.lookup_atom("hour")) {
             self.add_atom("mph", m.unit.div(&h.unit), m.factor / h.factor);
+            self.set_canonical("mph", "mph");
         }
         if let (Some(km), Some(h)) = (self.lookup_atom("kilometer"), self.lookup_atom("hour")) {
             self.add_atom("kph", km.unit.div(&h.unit), km.factor / h.factor);
+            self.set_canonical("kph", "kph");
         }
         // Calendar period atoms. These override pint's linear month/year
         // definitions (which we skip during loading via `is_period_unit`).
@@ -42,18 +44,21 @@ impl UnitRegistry {
         // no fixed-second value for them without an anchor instant.
         for name in ["cal_day", "cal_days", "calendar_day", "calendar_days"] {
             self.add_atom_full(name, AtomDef::period(0, 0, 1));
+            self.set_canonical(name, "calendar_day");
         }
         for name in [
             "cal_month", "cal_months", "calendar_month", "calendar_months",
             "month", "months", "mo",
         ] {
             self.add_atom_full(name, AtomDef::period(0, 1, 0));
+            self.set_canonical(name, "month");
         }
         for name in [
             "cal_year", "cal_years", "calendar_year", "calendar_years",
             "year", "years", "yr",
         ] {
             self.add_atom_full(name, AtomDef::period(1, 0, 0));
+            self.set_canonical(name, "year");
         }
     }
 }
@@ -180,8 +185,6 @@ fn parse_definition(reg: &mut UnitRegistry, line: &str) -> Result<(), ()> {
             _ => return Err(()),
         };
         let factor = if head == "gram" { 0.001 } else { 1.0 };
-        // Base-unit declarations don't normally have offsets; if one slips
-        // through (`kelvin = [temperature]; offset: 0`), treat it as linear.
         let off = offset.unwrap_or(0.0);
         let kind = if unit == Unit::KELVIN && off != 0.0 {
             AtomKind::AffineTemp
@@ -189,10 +192,10 @@ fn parse_definition(reg: &mut UnitRegistry, line: &str) -> Result<(), ()> {
             AtomKind::Linear
         };
         let def = AtomDef { unit, factor, offset: off, kind };
-        add_with_plural(reg, head, def);
+        add_with_plural(reg, head, head, def);
         for alias in &aliases {
             if is_simple_ident(alias) {
-                add_with_plural(reg, alias, def);
+                add_with_plural(reg, alias, head, def);
             }
         }
         return Ok(());
@@ -206,10 +209,10 @@ fn parse_definition(reg: &mut UnitRegistry, line: &str) -> Result<(), ()> {
         AtomKind::Linear
     };
     let def = AtomDef { unit, factor, offset: off, kind };
-    add_with_plural(reg, head, def);
+    add_with_plural(reg, head, head, def);
     for alias in &aliases {
         if is_simple_ident(alias) {
-            add_with_plural(reg, alias, def);
+            add_with_plural(reg, alias, head, def);
         }
     }
     Ok(())
@@ -219,10 +222,13 @@ fn parse_definition(reg: &mut UnitRegistry, line: &str) -> Result<(), ()> {
 /// `seconds`, `meters` all resolve. Skip short symbols (≤2 chars) to avoid
 /// nonsense aliases: pluralizing `m` (meter) → `ms` would shadow
 /// millisecond, `a` (year) → `as` would shadow attosecond, and so on.
-fn add_with_plural(reg: &mut UnitRegistry, name: &str, def: AtomDef) {
+fn add_with_plural(reg: &mut UnitRegistry, name: &str, canonical: &str, def: AtomDef) {
     reg.add_atom_full(name, def);
+    reg.set_canonical(name, canonical);
     if name.len() >= 3 && !name.ends_with('s') {
-        reg.add_atom_full(&format!("{name}s"), def);
+        let plural = format!("{name}s");
+        reg.add_atom_full(&plural, def);
+        reg.set_canonical(&plural, canonical);
     }
 }
 

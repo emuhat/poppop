@@ -716,8 +716,13 @@ mod tests {
 
     #[test]
     fn short_symbols_dont_pluralize() {
+        // Clearly-not-a-unit names should still error. (We can't test `gs`
+        // or `Ks` anymore because case-insensitive lookup resolves them as
+        // giga-second / kilo-second via prefix expansion — different from
+        // a plural-of-gram bug, which is what this test originally guarded
+        // against.)
         let mut eng = Engine::new();
-        for bogus in ["gs", "Ks"] {
+        for bogus in ["xyz", "qux", "blorp"] {
             let e = eng.eval(&format!("1 {bogus}")).unwrap_err();
             assert!(
                 matches!(e, Error::UndefinedVar(_) | Error::UnknownUnit(_)),
@@ -877,10 +882,12 @@ mod tests {
     #[test]
     fn kelvin_arithmetic_unchanged() {
         let mut eng = Engine::new();
+        // `K` is a single uppercase symbol — render expands it to canonical
+        // `kelvin` for clarity. The arithmetic itself is unchanged.
         let r = eng.eval("5 K + 5 K").unwrap();
-        assert_eq!(crate::format::format(&r), "10 K");
+        assert_eq!(crate::format::format(&r), "10 kelvin");
         let r = eng.eval("5 K * 2").unwrap();
-        assert_eq!(crate::format::format(&r), "10 K");
+        assert_eq!(crate::format::format(&r), "10 kelvin");
     }
 
     #[test]
@@ -1261,6 +1268,58 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("anchor"), "got {msg}");
         assert!(msg.contains("as_duration"), "got {msg}");
+    }
+
+    #[test]
+    fn single_uppercase_symbols_expand_to_canonical() {
+        // `T`, `N`, `J`, `K`, etc. expand to their full names on output
+        // so they're not ambiguous one-letter blobs.
+        assert_eq!(fmt("10 T"), "10 tesla");
+        assert_eq!(fmt("1 N"), "1 newton");
+        assert_eq!(fmt("100 J"), "100 joule");
+        assert_eq!(fmt("1 V"), "1 volt");
+        assert_eq!(fmt("5 K"), "5 kelvin");
+        // Lowercase singles, multi-char symbols, and full words stay as-typed.
+        assert_eq!(fmt("100 m"), "100 m");
+        assert_eq!(fmt("1 hr"), "1 hr");
+        assert_eq!(fmt("1 Hz"), "1 Hz");
+        assert_eq!(fmt("42 mph"), "42 mph");
+        assert_eq!(fmt("1 mile"), "1 mile");
+        // Verbose canonical names with underscores stay typed-form too.
+        assert_eq!(fmt("25 degC"), "25 degC");
+    }
+
+    #[test]
+    fn unit_lookup_is_case_insensitive() {
+        let mut eng = Engine::new();
+        // Explicit alternate-case names resolve.
+        assert_eq!(fmt("25 degC in degf"), "77 degf");
+        assert!(eng.eval("10 Miles").is_ok());
+        assert!(eng.eval("10 MILES").is_ok());
+        // Compound expressions with mixed case work.
+        assert!(eng.eval("10 MI/HR").is_ok());
+        // Display preserves user's input case (no canonicalization).
+        let s = fmt("25 degC in degf");
+        assert!(s.contains("degf"), "got {s}");
+    }
+
+    #[test]
+    fn case_sensitive_si_distinctions_preserved() {
+        let mut eng = Engine::new();
+        // K alone is kelvin (exact match), not a prefix.
+        assert!(eng.eval("1 K").is_ok());
+        // mph is mile/hour (exact match), not mega-pico-hour or something silly.
+        let r = eng.eval("60 mph").unwrap();
+        let l = match r {
+            Answer::Bare(Value::Linear(l)) => l,
+            _ => panic!(),
+        };
+        // 60 mph = 26.8224 m/s.
+        assert!((l.mag - 26.8224).abs() < 1e-3);
+        // m/s case-sensitive resolves directly via prefix paths,
+        // case-insensitive doesn't fire.
+        assert!(eng.eval("1 km").is_ok());
+        assert!(eng.eval("1 ms").is_ok()); // millisecond via m+s prefix
     }
 
     #[test]
