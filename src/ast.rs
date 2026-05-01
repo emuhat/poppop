@@ -7,6 +7,9 @@ pub enum Statement {
 #[derive(Debug, Clone)]
 pub enum Expr {
     Number(f64, Option<UnitExpr>),
+    /// `YYYY-MM-DD` date literal. Stored as components; the eval phase
+    /// converts to `chrono::NaiveDateTime` at UTC midnight.
+    DateLiteral(i32, u32, u32),
     Var(String),
     Binary(Box<Expr>, Op, Box<Expr>),
     Unary(UnaryOp, Box<Expr>),

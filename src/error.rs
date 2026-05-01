@@ -14,6 +14,9 @@ pub enum Error {
     #[error("temperature arithmetic: {0}")]
     TempArithmetic(String),
 
+    #[error("time arithmetic: {0}")]
+    TimeArithmetic(String),
+
     #[error("unknown function: {0}")]
     UnknownFn(String),
 

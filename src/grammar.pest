@@ -23,11 +23,18 @@ mul_op      = { "*" | "/" }
 power       = { atom ~ ("^" ~ pow_exp)? }
 pow_exp     = { neg_op? ~ atom }
 
-atom        = { time_with_unit | number | call | var | paren }
+atom        = { date_literal | time_with_unit | number | call | var | paren }
 paren       = { "(" ~ expression ~ ")" }
 call        = { ident ~ "(" ~ expression ~ ("," ~ expression)* ~ ")" }
 var         = { ident }
 time_with_unit   = { time_literal ~ unit_expr? }
+
+// `2026-04-30` — atomic so whitespace between components is rejected.
+// The 4-2-2 digit shape disambiguates from `2026 - 4 - 30` arithmetic.
+date_literal = ${ year_part ~ "-" ~ month_part ~ "-" ~ day_part }
+year_part   = @{ ASCII_DIGIT{4} }
+month_part  = @{ ASCII_DIGIT{2} }
+day_part    = @{ ASCII_DIGIT{2} }
 
 unit_expr   = { unit_factor ~ (unit_op ~ unit_factor)* }
 unit_op     = { "*" | "/" }

@@ -2,9 +2,10 @@ use std::collections::HashMap;
 
 use crate::ast::*;
 use crate::builtins;
+use crate::calendar;
 use crate::error::Error;
-use crate::unit::{Resolved, Unit, UnitRegistry};
-use crate::value::Value;
+use crate::unit::{AtomKind, Unit, UnitRegistry};
+use crate::value::{LinearValue, PeriodValue, Value};
 
 pub struct Env {
     /// Keys stored lowercased — variable names are case-insensitive.
@@ -20,8 +21,6 @@ impl Env {
             vars: HashMap::new(),
             registry: UnitRegistry::standard(),
         };
-        // TI-82 style: Ans starts at 0 so referencing it before any
-        // computation gives a sensible value rather than an error.
         env.set("Ans", Value::dimensionless(0.0));
         env
     }
@@ -34,10 +33,6 @@ impl Env {
         self.vars.insert(name.to_ascii_lowercase(), value);
     }
 
-    /// Drop user bindings and re-bind `Ans = 0`. The unit registry is left
-    /// intact — this is the cheap path for "recompute the whole notebook"
-    /// frontends that want a fresh env on every render but can't afford the
-    /// pint loader's multi-pass cost.
     pub fn reset(&mut self) {
         self.vars.clear();
         self.set("Ans", Value::dimensionless(0.0));
@@ -59,9 +54,6 @@ impl Engine {
         Engine { env: Env::new() }
     }
 
-    /// Cheap state reset: clears user bindings and resets `Ans`, but keeps
-    /// the (expensive) unit registry. Use this when re-evaluating from
-    /// scratch on every edit (e.g. notebook frontends).
     pub fn reset(&mut self) {
         self.env.reset();
     }
@@ -76,8 +68,6 @@ impl Engine {
             }
             Statement::Expr(e) => Answer::Bare(eval_expr(&mut self.env, &e)?),
         };
-        // TI-82 style: Ans tracks the most recent result. Failed evals
-        // don't update Ans (we only get here on Ok).
         let last_value = match &answer {
             Answer::Bare(v) => v.clone(),
             Answer::Assigned { value, .. } => value.clone(),
@@ -96,87 +86,28 @@ impl Default for Engine {
 pub fn eval_expr(env: &mut Env, e: &Expr) -> Result<Value, Error> {
     match e {
         Expr::Number(n, None) => Ok(Value::dimensionless(*n)),
-        Expr::Number(n, Some(u)) => {
-            let r = env.registry.resolve(u)?;
-            // Affine temperature literal: single-atom resolution carries
-            // affine metadata; apply offset and mark the result absolute.
-            // `is_absolute_temp` is set ONLY here at literal-construction
-            // time (and propagated through Convert). Eval never infers it
-            // from `unit` or `display` later.
-            if let Some(atom) = r.atom {
-                if atom.is_affine_temp {
-                    let mag = n * atom.factor + atom.offset;
-                    return Ok(Value::absolute_temp(mag, u.clone()));
-                }
-            }
-            Ok(Value::with_display(n * r.factor, r.unit, u.clone()))
-        }
-        Expr::Var(name) => {
-            // User-bound variables shadow units. Falling back to the registry lets
-            // bare unit names like `mph` evaluate to `0.44704 m/s`, so implicit
-            // multiplication (`4 mph` → `4 * mph`) gives the natural result.
-            if let Some(v) = env.get(name) {
-                return Ok(v.clone());
-            }
-            let atom = UnitExpr::Atom(name.clone(), 1);
-            match env.registry.resolve(&atom) {
-                Ok(r) => {
-                    // A bare affine atom name (e.g. `degC` alone) resolves to
-                    // "1 in that unit," which for Celsius is 1 °C = 274.15 K
-                    // absolute.
-                    if let Some(def) = r.atom {
-                        if def.is_affine_temp {
-                            let mag = 1.0 * def.factor + def.offset;
-                            return Ok(Value::absolute_temp(mag, atom));
-                        }
-                    }
-                    Ok(Value::with_display(r.factor, r.unit, atom))
-                }
-                Err(_) => Err(Error::UndefinedVar(name.clone())),
-            }
-        }
-        Expr::Unary(UnaryOp::Neg, inner) => {
-            let v = eval_expr(env, inner)?;
-            // Negation preserves all flags. `-(25 degC)` is conceptually a
-            // negative absolute reading; the user asked for it explicitly.
-            Ok(Value {
-                mag: -v.mag,
-                unit: v.unit,
-                display: v.display,
-                display_explicit: v.display_explicit,
-                force_hms: v.force_hms,
-                is_absolute_temp: v.is_absolute_temp,
-                render_as_delta: v.render_as_delta,
-            })
-        }
+        Expr::Number(n, Some(u)) => eval_number_with_unit(env, *n, u),
+        Expr::DateLiteral(y, m, d) => calendar::make_instant(*y, *m, *d).map(Value::Instant),
+        Expr::Var(name) => eval_var(env, name),
+        Expr::Unary(UnaryOp::Neg, inner) => negate(eval_expr(env, inner)?),
         Expr::Binary(a, op, b) => {
-            // Affine-literal shortcut: `25 degC`, `100 degF`, etc. parse as
-            // `Number(n) * Var(ident)` because the grammar uses units-as-
-            // values + implicit multiplication. If `ident` is a registered
-            // affine atom, treat the whole `<number> * <affine>` as the
-            // literal `n <affine>` and apply the offset (so the result is
-            // an absolute temperature with `is_absolute_temp = true`).
-            //
-            // Without this shortcut, evaluation would naively multiply 25
-            // by `1 degC` (which itself is 274.15 K absolute), and that
-            // multiplication would correctly error per the spec — but
-            // `25 degC` is the canonical literal form, not a scalar
-            // multiplication. Recognizing the AST shape is the simplest
-            // way to bridge the grammar to the spec.
+            // Affine-literal shortcut: `25 degC` parses as `25 * Var(degC)`
+            // due to units-as-values + implicit multiplication. Catch that
+            // pattern before normal eval so we apply the offset and produce
+            // an absolute literal instead of trying to multiply by an
+            // already-absolute Kelvin value.
             if let Op::Mul = op {
                 if let Some(v) = try_affine_literal(env, a, b) {
+                    return Ok(v);
+                }
+                // Period-literal shortcut: `5 cal_days`, `1 month`, etc.
+                if let Some(v) = try_period_literal(env, a, b) {
                     return Ok(v);
                 }
             }
             let va = eval_expr(env, a)?;
             let vb = eval_expr(env, b)?;
-            match op {
-                Op::Add => add_values(va, vb),
-                Op::Sub => sub_values(va, vb),
-                Op::Mul => mul_values(va, vb),
-                Op::Div => div_values(va, vb),
-                Op::Pow => pow_values(va, vb),
-            }
+            apply_binary(*op, va, vb)
         }
         Expr::Call(name, args) => {
             let mut vs = Vec::with_capacity(args.len());
@@ -189,231 +120,407 @@ pub fn eval_expr(env: &mut Env, e: &Expr) -> Result<Value, Error> {
     }
 }
 
+fn eval_number_with_unit(env: &Env, n: f64, u: &UnitExpr) -> Result<Value, Error> {
+    let r = env.registry.resolve(u)?;
+    if let Some(atom) = r.atom {
+        match atom.kind {
+            AtomKind::AffineTemp => {
+                let mag = n * atom.factor + atom.offset;
+                return Ok(Value::absolute_temp(mag, u.clone()));
+            }
+            AtomKind::Period { years, months, days } => {
+                if !is_integer(n) {
+                    return Err(Error::TimeArithmetic(
+                        "period literals require an integer count".to_string(),
+                    ));
+                }
+                let k = n as i32;
+                return Ok(Value::period(years * k, months * k, days * k));
+            }
+            AtomKind::Linear => {}
+        }
+    }
+    Ok(Value::with_display(n * r.factor, r.unit, u.clone()))
+}
+
+fn eval_var(env: &Env, name: &str) -> Result<Value, Error> {
+    if let Some(v) = env.get(name) {
+        return Ok(v.clone());
+    }
+    let atom = UnitExpr::Atom(name.to_string(), 1);
+    match env.registry.resolve(&atom) {
+        Ok(r) => {
+            if let Some(def) = r.atom {
+                match def.kind {
+                    AtomKind::AffineTemp => {
+                        let mag = def.factor + def.offset;
+                        return Ok(Value::absolute_temp(mag, atom));
+                    }
+                    AtomKind::Period { years, months, days } => {
+                        return Ok(Value::period(years, months, days));
+                    }
+                    AtomKind::Linear => {}
+                }
+            }
+            Ok(Value::with_display(r.factor, r.unit, atom))
+        }
+        Err(_) => Err(Error::UndefinedVar(name.to_string())),
+    }
+}
+
+fn negate(v: Value) -> Result<Value, Error> {
+    match v {
+        Value::Linear(l) => Ok(Value::Linear(LinearValue { mag: -l.mag, ..l })),
+        Value::Period(p) => Ok(Value::Period(PeriodValue {
+            years: -p.years,
+            months: -p.months,
+            days: -p.days,
+        })),
+        Value::Instant(_) => Err(Error::TimeArithmetic(
+            "cannot negate an instant".to_string(),
+        )),
+    }
+}
+
 /// Detect `Number(n) * Var(name)` where `name` resolves to an affine
 /// atom. This is how the grammar represents `25 degC` (because we use
-/// units-as-values with implicit multiplication). Returns the absolute
-/// temperature literal in Kelvin.
+/// units-as-values with implicit multiplication).
 fn try_affine_literal(env: &Env, a: &Expr, b: &Expr) -> Option<Value> {
-    let (n, name) = match (a, b) {
-        (Expr::Number(n, None), Expr::Var(name)) => (*n, name),
-        (Expr::Var(name), Expr::Number(n, None)) => (*n, name),
-        _ => return None,
-    };
-    // User-bound variables shadow units; if `name` is bound, it's not an
-    // affine literal pattern.
+    let (n, name) = number_var_pair(a, b)?;
     if env.get(name).is_some() {
         return None;
     }
-    let r = env
-        .registry
-        .resolve(&UnitExpr::Atom(name.clone(), 1))
-        .ok()?;
+    let r = env.registry.resolve(&UnitExpr::Atom(name.clone(), 1)).ok()?;
     let atom = r.atom?;
-    if !atom.is_affine_temp {
+    if !matches!(atom.kind, AtomKind::AffineTemp) {
         return None;
     }
     let mag = n * atom.factor + atom.offset;
     Some(Value::absolute_temp(mag, UnitExpr::Atom(name.clone(), 1)))
 }
 
-// ─── arithmetic ────────────────────────────────────────────────────────────
-//
-// Branch ONLY on `is_absolute_temp`. NEVER on `unit`, `display`, or atom
-// metadata. K is storage-only — the flag carries the semantic category.
+/// Detect `Number(n) * Var(name)` where `name` resolves to a Period atom
+/// (`cal_days`, `month`, `years`, etc.). Mirrors the affine-literal trick:
+/// the grammar treats `5 cal_days` as `5 * Var(cal_days)`, but semantically
+/// it's a period literal of 5 calendar days.
+fn try_period_literal(env: &Env, a: &Expr, b: &Expr) -> Option<Value> {
+    let (n, name) = number_var_pair(a, b)?;
+    if env.get(name).is_some() {
+        return None;
+    }
+    let r = env.registry.resolve(&UnitExpr::Atom(name.clone(), 1)).ok()?;
+    let atom = r.atom?;
+    let AtomKind::Period { years, months, days } = atom.kind else {
+        return None;
+    };
+    if !is_integer(n) {
+        // Non-integer scaling on a period is hard-error per spec; surface
+        // it via the actual arithmetic path so the user gets a TimeArithmetic
+        // error rather than a silent fallthrough.
+        return None;
+    }
+    let k = n as i32;
+    Some(Value::period(years * k, months * k, days * k))
+}
 
-fn add_values(va: Value, vb: Value) -> Result<Value, Error> {
-    match (va.is_absolute_temp, vb.is_absolute_temp) {
+fn number_var_pair<'a>(a: &'a Expr, b: &'a Expr) -> Option<(f64, &'a String)> {
+    match (a, b) {
+        (Expr::Number(n, None), Expr::Var(name)) => Some((*n, name)),
+        (Expr::Var(name), Expr::Number(n, None)) => Some((*n, name)),
+        _ => None,
+    }
+}
+
+fn is_integer(n: f64) -> bool {
+    n.is_finite() && (n - n.round()).abs() < 1e-9
+}
+
+// ─── arithmetic dispatcher ─────────────────────────────────────────────────
+//
+// Per the time spec: branch on Value variant ONLY. Per the temperature spec:
+// for Linear-Linear arithmetic, branch on `is_absolute_temp` ONLY. Never
+// infer semantics from `unit` or `display`.
+
+fn apply_binary(op: Op, va: Value, vb: Value) -> Result<Value, Error> {
+    use Value::*;
+    match (op, va, vb) {
+        (Op::Add, Linear(la), Linear(lb)) => add_linear(la, lb),
+        (Op::Sub, Linear(la), Linear(lb)) => sub_linear(la, lb),
+        (Op::Mul, Linear(la), Linear(lb)) => mul_linear(la, lb),
+        (Op::Div, Linear(la), Linear(lb)) => div_linear(la, lb),
+        (Op::Pow, Linear(la), Linear(lb)) => pow_linear(la, lb),
+
+        // Instant ± Duration → Instant.
+        (Op::Add, Instant(i), Linear(l)) | (Op::Add, Linear(l), Instant(i)) => {
+            calendar::instant_plus_duration(i, l).map(Value::Instant)
+        }
+        (Op::Sub, Instant(i), Linear(l)) => {
+            calendar::instant_minus_duration(i, l).map(Value::Instant)
+        }
+        // Instant - Instant → Duration.
+        (Op::Sub, Instant(a), Instant(b)) => Ok(calendar::instant_minus_instant(a, b)),
+
+        // Instant + Period → Instant. (Spec calls this case calendar-aware.)
+        (Op::Add, Instant(i), Period(p)) | (Op::Add, Period(p), Instant(i)) => {
+            calendar::instant_plus_period(i, p).map(Value::Instant)
+        }
+        (Op::Sub, Instant(i), Period(p)) => {
+            calendar::instant_minus_period(i, p).map(Value::Instant)
+        }
+
+        // Period ± Period → Period (component-wise, no normalization).
+        (Op::Add, Period(a), Period(b)) => Ok(Value::Period(PeriodValue {
+            years: a.years + b.years,
+            months: a.months + b.months,
+            days: a.days + b.days,
+        })),
+        (Op::Sub, Period(a), Period(b)) => Ok(Value::Period(PeriodValue {
+            years: a.years - b.years,
+            months: a.months - b.months,
+            days: a.days - b.days,
+        })),
+
+        // Period × scalar (integer only) → Period.
+        (Op::Mul, Period(p), Linear(l)) | (Op::Mul, Linear(l), Period(p)) => {
+            period_times_scalar(p, l)
+        }
+
+        // Everything else is an error per the spec.
+        (op, va, vb) => Err(time_arith_err(op, &va, &vb)),
+    }
+}
+
+fn time_arith_err(op: Op, va: &Value, vb: &Value) -> Error {
+    let kind = |v: &Value| match v {
+        Value::Linear(_) => "duration/scalar",
+        Value::Instant(_) => "instant",
+        Value::Period(_) => "period",
+    };
+    let op_name = match op {
+        Op::Add => "add",
+        Op::Sub => "subtract",
+        Op::Mul => "multiply",
+        Op::Div => "divide",
+        Op::Pow => "exponentiate",
+    };
+    Error::TimeArithmetic(format!(
+        "cannot {op_name} {} and {}",
+        kind(va),
+        kind(vb)
+    ))
+}
+
+fn period_times_scalar(p: PeriodValue, l: LinearValue) -> Result<Value, Error> {
+    if !l.unit.is_dimensionless() {
+        return Err(Error::TimeArithmetic(
+            "period can only be multiplied by a dimensionless integer".to_string(),
+        ));
+    }
+    if !is_integer(l.mag) {
+        return Err(Error::TimeArithmetic(
+            "period scaling requires an integer".to_string(),
+        ));
+    }
+    let k = l.mag as i32;
+    Ok(Value::Period(PeriodValue {
+        years: p.years * k,
+        months: p.months * k,
+        days: p.days * k,
+    }))
+}
+
+// ─── linear arithmetic (the existing temperature-aware logic) ──────────────
+
+fn add_linear(la: LinearValue, lb: LinearValue) -> Result<Value, Error> {
+    match (la.is_absolute_temp, lb.is_absolute_temp) {
         (true, true) => Err(Error::TempArithmetic(
             "cannot add two absolute temperatures".to_string(),
         )),
         (true, false) | (false, true) => {
-            // Absolute + linear → absolute. Magnitude is straight K addition;
-            // the absolute-flagged operand's display propagates so the result
-            // renders in the user's chosen scale.
-            require_same_unit(&va, &vb)?;
-            let (abs, _other) = if va.is_absolute_temp { (&va, &vb) } else { (&vb, &va) };
-            Ok(Value {
-                mag: va.mag + vb.mag,
-                unit: va.unit,
+            require_same_unit(&la, &lb)?;
+            let (abs, _other) = if la.is_absolute_temp { (&la, &lb) } else { (&lb, &la) };
+            Ok(Value::Linear(LinearValue {
+                mag: la.mag + lb.mag,
+                unit: la.unit,
                 display: abs.display.clone(),
                 is_absolute_temp: true,
                 ..Default::default()
-            })
+            }))
         }
         (false, false) => {
-            require_same_unit(&va, &vb)?;
-            Ok(Value {
-                mag: va.mag + vb.mag,
-                unit: va.unit,
-                display: va.display.or(vb.display),
+            require_same_unit(&la, &lb)?;
+            Ok(Value::Linear(LinearValue {
+                mag: la.mag + lb.mag,
+                unit: la.unit,
+                display: la.display.or(lb.display),
                 ..Default::default()
-            })
+            }))
         }
     }
 }
 
-fn sub_values(va: Value, vb: Value) -> Result<Value, Error> {
-    match (va.is_absolute_temp, vb.is_absolute_temp) {
+fn sub_linear(la: LinearValue, lb: LinearValue) -> Result<Value, Error> {
+    match (la.is_absolute_temp, lb.is_absolute_temp) {
         (true, true) => {
-            // Absolute - absolute → delta in K. The single case that clears
-            // is_absolute_temp and sets render_as_delta.
-            require_same_unit(&va, &vb)?;
-            Ok(Value {
-                mag: va.mag - vb.mag,
-                unit: va.unit,
+            require_same_unit(&la, &lb)?;
+            Ok(Value::Linear(LinearValue {
+                mag: la.mag - lb.mag,
+                unit: la.unit,
                 display: None,
                 render_as_delta: true,
                 ..Default::default()
-            })
+            }))
         }
         (true, false) => {
-            // Absolute - linear → absolute. (e.g. `25 degC - 5 K = 20 °C`)
-            require_same_unit(&va, &vb)?;
-            Ok(Value {
-                mag: va.mag - vb.mag,
-                unit: va.unit,
-                display: va.display,
+            require_same_unit(&la, &lb)?;
+            Ok(Value::Linear(LinearValue {
+                mag: la.mag - lb.mag,
+                unit: la.unit,
+                display: la.display,
                 is_absolute_temp: true,
                 ..Default::default()
-            })
+            }))
         }
         (false, true) => Err(Error::TempArithmetic(
             "cannot subtract an absolute temperature from a delta".to_string(),
         )),
         (false, false) => {
-            require_same_unit(&va, &vb)?;
-            Ok(Value {
-                mag: va.mag - vb.mag,
-                unit: va.unit,
-                display: va.display.or(vb.display),
+            require_same_unit(&la, &lb)?;
+            Ok(Value::Linear(LinearValue {
+                mag: la.mag - lb.mag,
+                unit: la.unit,
+                display: la.display.or(lb.display),
                 ..Default::default()
-            })
+            }))
         }
     }
 }
 
-fn mul_values(va: Value, vb: Value) -> Result<Value, Error> {
-    if va.is_absolute_temp || vb.is_absolute_temp {
+fn mul_linear(la: LinearValue, lb: LinearValue) -> Result<Value, Error> {
+    if la.is_absolute_temp || lb.is_absolute_temp {
         return Err(Error::TempArithmetic(
             "absolute temperatures cannot be scaled".to_string(),
         ));
     }
-    Ok(Value {
-        mag: va.mag * vb.mag,
-        unit: va.unit.mul(&vb.unit),
-        display: combine_display(va.display, vb.display, true),
+    Ok(Value::Linear(LinearValue {
+        mag: la.mag * lb.mag,
+        unit: la.unit.mul(&lb.unit),
+        display: combine_display(la.display, lb.display, true),
         ..Default::default()
-    })
+    }))
 }
 
-fn div_values(va: Value, vb: Value) -> Result<Value, Error> {
-    if va.is_absolute_temp || vb.is_absolute_temp {
+fn div_linear(la: LinearValue, lb: LinearValue) -> Result<Value, Error> {
+    if la.is_absolute_temp || lb.is_absolute_temp {
         return Err(Error::TempArithmetic(
             "absolute temperatures cannot be scaled".to_string(),
         ));
     }
-    Ok(Value {
-        mag: va.mag / vb.mag,
-        unit: va.unit.div(&vb.unit),
-        display: combine_display(va.display, vb.display, false),
+    Ok(Value::Linear(LinearValue {
+        mag: la.mag / lb.mag,
+        unit: la.unit.div(&lb.unit),
+        display: combine_display(la.display, lb.display, false),
         ..Default::default()
-    })
+    }))
 }
 
-fn pow_values(va: Value, vb: Value) -> Result<Value, Error> {
-    if va.is_absolute_temp || vb.is_absolute_temp {
+fn pow_linear(la: LinearValue, lb: LinearValue) -> Result<Value, Error> {
+    if la.is_absolute_temp || lb.is_absolute_temp {
         return Err(Error::TempArithmetic(
             "absolute temperatures cannot be scaled".to_string(),
         ));
     }
-    if !vb.unit.is_dimensionless() {
+    if !lb.unit.is_dimensionless() {
         return Err(Error::DimError(
             "exponent must be dimensionless".to_string(),
         ));
     }
-    let n = vb.mag;
+    let n = lb.mag;
     let int_exp = n.round() as i32;
     let is_int = (n - int_exp as f64).abs() < 1e-9;
     let unit = if is_int {
-        va.unit.pow(int_exp)
-    } else if va.unit.is_dimensionless() {
-        va.unit
+        la.unit.pow(int_exp)
+    } else if la.unit.is_dimensionless() {
+        la.unit
     } else {
         return Err(Error::DimError(
             "non-integer power requires a dimensionless base".to_string(),
         ));
     };
-    Ok(Value::new(va.mag.powf(n), unit))
+    Ok(Value::new(la.mag.powf(n), unit))
 }
 
 // ─── conversion ────────────────────────────────────────────────────────────
 
 fn convert_value(env: &mut Env, inner: &Expr, target: &UnitExpr) -> Result<Value, Error> {
     let v = eval_expr(env, inner)?;
-    // `in hms` is a display directive, not a unit conversion.
+    // Most conversions only apply to linear values. Instants and Periods get
+    // a clear error in v1 (no anchored period↔duration conversion yet).
+    let l = match v {
+        Value::Linear(l) => l,
+        Value::Instant(_) => {
+            return Err(Error::TimeArithmetic(
+                "cannot convert an instant via `in`".to_string(),
+            ));
+        }
+        Value::Period(_) => {
+            return Err(Error::TimeArithmetic(
+                "cannot convert a period to a unit (no anchor)".to_string(),
+            ));
+        }
+    };
+
     if matches!(target, UnitExpr::Atom(name, 1) if name == "hms") {
-        if !v.unit.is_pure_time() {
+        if !l.unit.is_pure_time() {
             return Err(Error::DimError(format!(
                 "`in hms` requires a time value, got {}",
-                render_unit(&v.unit)
+                render_unit(&l.unit)
             )));
         }
-        return Ok(Value::with_force_hms(v.mag, v.unit));
+        return Ok(Value::with_force_hms(l.mag, l.unit));
     }
+
     let r = env.registry.resolve(target)?;
-    if v.unit != r.unit {
+    if l.unit != r.unit {
         return Err(Error::UnitMismatch {
-            left: render_unit(&v.unit),
+            left: render_unit(&l.unit),
             right: render_unit(&r.unit),
         });
     }
-    // Check whether the target is a single-atom affine unit (degC/degF).
-    // The decision below depends ONLY on (source.is_absolute_temp,
-    // target_is_affine). Source `unit` and `display` are never inspected.
     let target_is_affine = r
         .atom
         .as_ref()
-        .map(|a| a.is_affine_temp)
+        .map(|a| matches!(a.kind, AtomKind::AffineTemp))
         .unwrap_or(false);
 
     if target_is_affine {
-        // `<abs> in <affine>` keeps it absolute, just changes display.
-        // `<linear> in <affine>` produces a delta in that scale.
-        Ok(Value {
-            mag: v.mag,
-            unit: v.unit,
+        Ok(Value::Linear(LinearValue {
+            mag: l.mag,
+            unit: l.unit,
             display: Some(target.clone()),
             display_explicit: true,
             force_hms: false,
-            is_absolute_temp: v.is_absolute_temp,
-            render_as_delta: !v.is_absolute_temp || v.render_as_delta,
-        })
+            is_absolute_temp: l.is_absolute_temp,
+            render_as_delta: !l.is_absolute_temp || l.render_as_delta,
+        }))
     } else {
-        // Target is K, a compound, or any non-affine unit.
-        // Critical: is_absolute_temp propagates UNCHANGED. An `in K` on an
-        // absolute keeps the absolute flag — that's how we prevent the
-        // back-door `(25 degC in K) + (25 degC in K)` bug. NEVER infer
-        // semantic category from `target == K`.
-        Ok(Value {
-            mag: v.mag,
-            unit: v.unit,
+        // Critical: is_absolute_temp propagates UNCHANGED. `in K` on an
+        // absolute keeps the flag — preventing the `(25 degC in K) +
+        // (25 degC in K)` back-door.
+        Ok(Value::Linear(LinearValue {
+            mag: l.mag,
+            unit: l.unit,
             display: Some(target.clone()),
             display_explicit: true,
             force_hms: false,
-            is_absolute_temp: v.is_absolute_temp,
-            render_as_delta: v.render_as_delta,
-        })
+            is_absolute_temp: l.is_absolute_temp,
+            render_as_delta: l.render_as_delta,
+        }))
     }
 }
 
 // ─── helpers ───────────────────────────────────────────────────────────────
 
-fn _resolved_signature(_: &Resolved) {} // keep `Resolved` reference compiling if unused
-
-/// Combine display hints across multiplication/division. Returns `Some(combined)`
-/// only when at least one side has a display; otherwise None. The combined hint
-/// is the literal Mul/Div of the sides — the formatter validates dim-match before
-/// using it, so junk combinations silently fall back to the base-unit renderer.
 fn combine_display(
     a: Option<UnitExpr>,
     b: Option<UnitExpr>,
@@ -439,7 +546,7 @@ fn combine_display(
     }
 }
 
-fn require_same_unit(a: &Value, b: &Value) -> Result<(), Error> {
+fn require_same_unit(a: &LinearValue, b: &LinearValue) -> Result<(), Error> {
     if a.unit != b.unit {
         Err(Error::UnitMismatch {
             left: render_unit(&a.unit),
@@ -458,6 +565,10 @@ fn render_unit(u: &Unit) -> String {
     }
 }
 
+// keep Resolved name imported for use in dependents; silence unused warn
+#[allow(dead_code)]
+fn _resolved_signature(_: &crate::unit::Resolved) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,27 +581,34 @@ mod tests {
         }
     }
 
+    fn eval_linear(s: &str) -> LinearValue {
+        match eval_str(s) {
+            Value::Linear(l) => l,
+            other => panic!("expected Linear, got {other:?}"),
+        }
+    }
+
     fn approx_eq(a: f64, b: f64, eps: f64) -> bool {
         (a - b).abs() < eps
     }
 
     #[test]
     fn pure_number() {
-        let v = eval_str("42");
+        let v = eval_linear("42");
         assert_eq!(v.mag, 42.0);
         assert!(v.unit.is_dimensionless());
     }
 
     #[test]
     fn mph_to_base() {
-        let v = eval_str("42 mph");
+        let v = eval_linear("42 mph");
         assert!(approx_eq(v.mag, 42.0 * 1609.344 / 3600.0, 1e-9));
         assert_eq!(v.unit, Unit { m: 1, s: -1, ..Unit::DIMENSIONLESS });
     }
 
     #[test]
     fn add_same_unit() {
-        let v = eval_str("1 m + 2 m");
+        let v = eval_linear("1 m + 2 m");
         assert!(approx_eq(v.mag, 3.0, 1e-9));
     }
 
@@ -503,7 +621,7 @@ mod tests {
 
     #[test]
     fn pace_golden() {
-        let v = eval_str("26.2 miles * 9:09 min/mile");
+        let v = eval_linear("26.2 miles * 9:09 min/mile");
         assert!(approx_eq(v.mag, 14383.8, 1e-1), "got mag {}", v.mag);
         assert_eq!(v.unit, Unit::SECONDS);
     }
@@ -514,8 +632,9 @@ mod tests {
         match eng.eval("x = 10 m").unwrap() {
             Answer::Assigned { name, value } => {
                 assert_eq!(name, "x");
-                assert_eq!(value.mag, 10.0);
-                assert_eq!(value.unit, Unit::METERS);
+                let l = value.as_linear().unwrap();
+                assert_eq!(l.mag, 10.0);
+                assert_eq!(l.unit, Unit::METERS);
             }
             _ => panic!("expected Assigned"),
         }
@@ -523,8 +642,9 @@ mod tests {
             Answer::Bare(v) => v,
             _ => panic!(),
         };
-        assert!(approx_eq(v.mag, 10.0 / 3.0, 1e-9));
-        assert_eq!(v.unit, Unit { m: 1, s: -1, ..Unit::DIMENSIONLESS });
+        let l = v.as_linear().unwrap();
+        assert!(approx_eq(l.mag, 10.0 / 3.0, 1e-9));
+        assert_eq!(l.unit, Unit { m: 1, s: -1, ..Unit::DIMENSIONLESS });
     }
 
     #[test]
@@ -634,12 +754,12 @@ mod tests {
         assert_eq!(crate::format::format(&answer), "1 hr");
     }
 
-    // ─── temperature tests (the new spec) ─────────────────────────────────
+    // ─── temperature tests ─────────────────────────────────────────────────
 
     #[test]
     fn celsius_storage_in_kelvin() {
-        let v = eval_str("25 degC");
-        assert!((v.mag - 298.15).abs() < 1e-9, "got mag {}", v.mag);
+        let v = eval_linear("25 degC");
+        assert!((v.mag - 298.15).abs() < 1e-9);
         assert_eq!(v.unit, Unit::KELVIN);
         assert!(v.is_absolute_temp);
         assert!(!v.render_as_delta);
@@ -647,9 +767,8 @@ mod tests {
 
     #[test]
     fn fahrenheit_storage_in_kelvin() {
-        // 100 °F = 310.928 K
-        let v = eval_str("100 degF");
-        assert!((v.mag - 310.92777777778).abs() < 1e-6, "got mag {}", v.mag);
+        let v = eval_linear("100 degF");
+        assert!((v.mag - 310.92777777778).abs() < 1e-6);
         assert_eq!(v.unit, Unit::KELVIN);
         assert!(v.is_absolute_temp);
     }
@@ -670,16 +789,14 @@ mod tests {
         let mut eng = Engine::new();
         let r = eng.eval("100 degF in degC").unwrap();
         let s = crate::format::format(&r);
-        // 100 °F = 37.777... °C
         assert!(s.starts_with("37.77"), "100°F → ~37.78°C, got {s}");
     }
 
     #[test]
     fn celsius_to_kelvin_preserves_absoluteness() {
-        let v = eval_str("25 degC in K");
+        let v = eval_linear("25 degC in K");
         assert_eq!(v.unit, Unit::KELVIN);
         assert!((v.mag - 298.15).abs() < 1e-9);
-        // The keystone invariant: in K does NOT erase is_absolute_temp.
         assert!(v.is_absolute_temp,
                 "25 degC in K must remain absolute — that's the whole point");
     }
@@ -687,22 +804,12 @@ mod tests {
     #[test]
     fn add_two_absolutes_errors() {
         let mut eng = Engine::new();
-        assert!(matches!(
-            eng.eval("25 degC + 25 degC"),
-            Err(Error::TempArithmetic(_))
-        ));
-        assert!(matches!(
-            eng.eval("100 degF + 50 degC"),
-            Err(Error::TempArithmetic(_))
-        ));
+        assert!(matches!(eng.eval("25 degC + 25 degC"), Err(Error::TempArithmetic(_))));
+        assert!(matches!(eng.eval("100 degF + 50 degC"), Err(Error::TempArithmetic(_))));
     }
 
     #[test]
     fn back_door_via_kelvin_still_errors() {
-        // The exact case the spec is designed to prevent. After `in K`,
-        // unit == K and display == K, but is_absolute_temp is still true,
-        // so addition still errors. NEVER tempt a future reader to "optimize"
-        // by inferring linearity from unit == K.
         let mut eng = Engine::new();
         assert!(matches!(
             eng.eval("(25 degC in K) + (25 degC in K)"),
@@ -715,31 +822,28 @@ mod tests {
         let mut eng = Engine::new();
         let r = eng.eval("30 degC - 25 degC").unwrap();
         assert_eq!(crate::format::format(&r), "5 K");
-        // Internally: not absolute, render_as_delta = true.
         let v = match r {
             Answer::Bare(v) => v,
             _ => panic!(),
         };
-        assert!(!v.is_absolute_temp);
-        assert!(v.render_as_delta);
-        assert_eq!(v.unit, Unit::KELVIN);
-        assert!((v.mag - 5.0).abs() < 1e-9);
+        let l = v.as_linear().unwrap();
+        assert!(!l.is_absolute_temp);
+        assert!(l.render_as_delta);
+        assert_eq!(l.unit, Unit::KELVIN);
+        assert!((l.mag - 5.0).abs() < 1e-9);
     }
 
     #[test]
     fn abs_plus_delta_yields_abs() {
         let mut eng = Engine::new();
-        // 25 degC + 5 K = 303.15 K, displayed in degC = 30 °C
         let r = eng.eval("25 degC + 5 K").unwrap();
         let s = crate::format::format(&r);
-        assert!(s.starts_with("30") && s.contains("°C") || s.contains("degC"),
-                "got {s}");
+        assert!(s.starts_with("30") && (s.contains("°C") || s.contains("degC")), "got {s}");
     }
 
     #[test]
     fn abs_minus_delta_yields_abs() {
         let mut eng = Engine::new();
-        // 25 degC - 5 K = 293.15 K = 20 °C
         let r = eng.eval("25 degC - 5 K").unwrap();
         let s = crate::format::format(&r);
         assert!(s.starts_with("20"), "got {s}");
@@ -748,27 +852,15 @@ mod tests {
     #[test]
     fn delta_minus_abs_errors() {
         let mut eng = Engine::new();
-        assert!(matches!(
-            eng.eval("5 K - 25 degC"),
-            Err(Error::TempArithmetic(_))
-        ));
+        assert!(matches!(eng.eval("5 K - 25 degC"), Err(Error::TempArithmetic(_))));
     }
 
     #[test]
     fn abs_times_scalar_errors() {
         let mut eng = Engine::new();
-        assert!(matches!(
-            eng.eval("25 degC * 2"),
-            Err(Error::TempArithmetic(_))
-        ));
-        assert!(matches!(
-            eng.eval("100 degF / 2"),
-            Err(Error::TempArithmetic(_))
-        ));
-        assert!(matches!(
-            eng.eval("25 degC ^ 2"),
-            Err(Error::TempArithmetic(_))
-        ));
+        assert!(matches!(eng.eval("25 degC * 2"), Err(Error::TempArithmetic(_))));
+        assert!(matches!(eng.eval("100 degF / 2"), Err(Error::TempArithmetic(_))));
+        assert!(matches!(eng.eval("25 degC ^ 2"), Err(Error::TempArithmetic(_))));
     }
 
     #[test]
@@ -783,12 +875,9 @@ mod tests {
     #[test]
     fn delta_converted_to_affine_uses_delta_marker() {
         let mut eng = Engine::new();
-        // 30 °C - 25 °C = 5 K (delta). `in degC` should keep the delta
-        // semantics and add a Δ marker.
         let r = eng.eval("(30 degC - 25 degC) in degC").unwrap();
         let s = crate::format::format(&r);
         assert!(s.contains("Δ"), "expected Δ marker in {s}");
-        // 5 K in degC: linear → affine, delta display.
         let r = eng.eval("5 K in degC").unwrap();
         let s = crate::format::format(&r);
         assert!(s.contains("Δ"), "expected Δ marker in {s}");
@@ -798,13 +887,11 @@ mod tests {
     fn delta_times_scalar_works() {
         let mut eng = Engine::new();
         let r = eng.eval("(30 degC - 25 degC) * 3").unwrap();
-        // 5 K * 3 = 15 K
         assert_eq!(crate::format::format(&r), "15 K");
     }
 
     #[test]
     fn abs_added_to_zero_kelvin_unchanged() {
-        // Edge case: 25 degC + 0 K = 25 degC absolute.
         let mut eng = Engine::new();
         let r = eng.eval("25 degC + 0 K").unwrap();
         let s = crate::format::format(&r);
@@ -813,30 +900,255 @@ mod tests {
 
     #[test]
     fn absolute_temp_chained_conversions_preserve_flag() {
-        // 25 degC in K in degF should give 77 °F absolute.
         let mut eng = Engine::new();
         let r = eng.eval("(25 degC in K) in degF").unwrap();
         let s = crate::format::format(&r);
         assert!(s.starts_with("77"), "25°C → K → °F should be ~77°F, got {s}");
-        // And another addition should still error if we add another absolute.
-        // (Note: this isn't possible to test on Ans because abs+abs syntax
-        //  would error before chaining; we trust the flag propagation tests above.)
     }
 
     #[test]
     fn negation_preserves_absoluteness() {
-        // -(25 degC) is conceptually a negative absolute reading. Eval keeps
-        // is_absolute_temp = true on negation.
-        let v = eval_str("-(25 degC)");
+        let v = eval_linear("-(25 degC)");
         assert!(v.is_absolute_temp);
         assert!((v.mag - (-298.15)).abs() < 1e-9);
     }
 
     #[test]
     fn rankine_still_linear() {
-        // Rankine has offset 0 (it shares Kelvin's zero point, just scales by 5/9).
-        // Should load as a plain linear unit, no affine semantics.
-        let v = eval_str("1 rankine");
+        let v = eval_linear("1 rankine");
         assert!(!v.is_absolute_temp, "rankine has offset 0; should be linear");
+    }
+
+    // ─── date/time tests ───────────────────────────────────────────────────
+
+    fn fmt(s: &str) -> String {
+        let mut eng = Engine::new();
+        crate::format::format(&eng.eval(s).unwrap())
+    }
+
+    fn fmt_err(s: &str) -> Error {
+        let mut eng = Engine::new();
+        eng.eval(s).unwrap_err()
+    }
+
+    #[test]
+    fn date_literal_parses_to_instant() {
+        let v = eval_str("2026-04-30");
+        assert!(v.is_instant());
+        assert_eq!(fmt("2026-04-30"), "2026-04-30");
+    }
+
+    #[test]
+    fn date_plus_duration() {
+        assert_eq!(fmt("2026-04-30 + 5 hours"), "2026-04-30T05:00:00Z");
+        assert_eq!(fmt("2026-04-30 + 90 min"), "2026-04-30T01:30:00Z");
+    }
+
+    #[test]
+    fn date_minus_duration() {
+        assert_eq!(fmt("2026-04-30 - 1 hour"), "2026-04-29T23:00:00Z");
+    }
+
+    #[test]
+    fn date_minus_date_yields_duration() {
+        // The Linear result has unit=SECONDS, so HMS auto-format kicks in.
+        assert_eq!(fmt("2026-04-30 - 2026-04-29"), "24:00:00.00");
+        // User can convert to plain seconds:
+        assert_eq!(fmt("(2026-04-30 - 2026-04-29) in seconds"), "86400 seconds");
+    }
+
+    #[test]
+    fn date_plus_month_clamps_jan31() {
+        assert_eq!(fmt("2026-01-31 + 1 month"), "2026-02-28");
+    }
+
+    #[test]
+    fn date_minus_month_clamps_mar31() {
+        assert_eq!(fmt("2026-03-31 - 1 month"), "2026-02-28");
+    }
+
+    #[test]
+    fn period_plus_period_component_wise() {
+        assert_eq!(fmt("1 month + 2 months"), "P3M");
+        assert_eq!(fmt("1 year + 2 months + 3 cal_days"), "P1Y2M3D");
+    }
+
+    #[test]
+    fn period_minus_period_allows_negative_components() {
+        // `1 cal_day - 1 month` → Period { months: -1, days: 1 }.
+        // Note: bare `1 day` is Duration, so we use `cal_day` for Period math.
+        assert_eq!(fmt("1 cal_day - 1 month"), "P-1M1D");
+    }
+
+    #[test]
+    fn duration_plus_period_errors() {
+        assert!(matches!(fmt_err("5 hours + 1 month"), Error::TimeArithmetic(_)));
+        assert!(matches!(fmt_err("1 month + 5 hours"), Error::TimeArithmetic(_)));
+    }
+
+    #[test]
+    fn instant_times_scalar_errors() {
+        assert!(matches!(fmt_err("2026-04-30 * 2"), Error::TimeArithmetic(_)));
+    }
+
+    #[test]
+    fn instant_plus_instant_errors() {
+        assert!(matches!(
+            fmt_err("2026-04-30 + 2026-04-29"),
+            Error::TimeArithmetic(_)
+        ));
+    }
+
+    #[test]
+    fn period_times_int_scalar_works() {
+        assert_eq!(fmt("1 month * 3"), "P3M");
+        assert_eq!(fmt("3 * 1 month"), "P3M");
+    }
+
+    #[test]
+    fn period_times_float_errors() {
+        assert!(matches!(fmt_err("1 month * 1.5"), Error::TimeArithmetic(_)));
+    }
+
+    #[test]
+    fn period_times_dimensioned_errors() {
+        assert!(matches!(fmt_err("1 month * 5 m"), Error::TimeArithmetic(_)));
+    }
+
+    #[test]
+    fn five_days_still_duration() {
+        // The disambiguation rule: bare `days` stays Linear, not Period.
+        let v = eval_str("5 days");
+        let l = v.as_linear().expect("5 days should be Linear (Duration)");
+        assert!((l.mag - 5.0 * 86400.0).abs() < 1e-9);
+        assert_eq!(l.unit, Unit::SECONDS);
+    }
+
+    #[test]
+    fn cal_days_is_period() {
+        let v = eval_str("5 cal_days");
+        let p = v.as_period().expect("5 cal_days should be Period");
+        assert_eq!(p.days, 5);
+        assert_eq!(p.months, 0);
+        assert_eq!(p.years, 0);
+    }
+
+    #[test]
+    fn calendar_days_long_form_is_period() {
+        let v = eval_str("5 calendar_days");
+        assert!(v.is_period());
+    }
+
+    #[test]
+    fn month_is_period_only() {
+        // pint's linear month is overridden; bare `month` resolves to Period.
+        let v = eval_str("1 month");
+        let p = v.as_period().expect("1 month should be Period");
+        assert_eq!(p.months, 1);
+    }
+
+    #[test]
+    fn year_is_period_only() {
+        let v = eval_str("1 year");
+        let p = v.as_period().expect("1 year should be Period");
+        assert_eq!(p.years, 1);
+    }
+
+    #[test]
+    fn period_render_iso_8601() {
+        assert_eq!(fmt("1 year"), "P1Y");
+        assert_eq!(fmt("0 cal_days"), "P0D");
+        assert_eq!(fmt("1 year + 2 months + 3 cal_days"), "P1Y2M3D");
+    }
+
+    #[test]
+    fn date_arith_round_trip() {
+        // (Feb 28) - (Feb 28) = 0 seconds, HMS format for <60s is "0.00".
+        assert_eq!(fmt("(2026-01-31 + 1 month) - (2026-01-31 + 1 month)"), "0.00");
+    }
+
+    #[test]
+    fn invalid_date_errors() {
+        // 2026 isn't a leap year.
+        assert!(matches!(fmt_err("2026-02-29"), Error::TimeArithmetic(_)));
+        assert!(matches!(fmt_err("2026-13-01"), Error::TimeArithmetic(_)));
+    }
+
+    #[test]
+    fn instant_cannot_negate() {
+        assert!(matches!(fmt_err("-(2026-04-30)"), Error::TimeArithmetic(_)));
+    }
+
+    #[test]
+    fn period_negation_works() {
+        // Negation of a period flips component signs.
+        let v = eval_str("-(1 month)");
+        let p = v.as_period().expect("Period");
+        assert_eq!(p.months, -1);
+    }
+
+    #[test]
+    fn instant_minus_period() {
+        assert_eq!(fmt("2026-04-30 - 1 month"), "2026-03-30");
+        assert_eq!(fmt("2026-03-30 - 2 cal_days"), "2026-03-28");
+    }
+
+    #[test]
+    fn date_arith_preserves_canonical_pace_example() {
+        // The Phase 1 canonical example must still work after the refactor.
+        assert_eq!(fmt("26.2 miles * 9:09 min/mile"), "03:59:43.80");
+    }
+
+    #[test]
+    fn date_literal_in_arithmetic_with_parens() {
+        // Convoluted but spec-compliant: subtract a Duration from a date,
+        // then add a Period to that.
+        assert_eq!(fmt("(2026-04-30 - 1 hour) + 1 month"), "2026-05-29T23:00:00Z");
+    }
+
+    #[test]
+    fn five_days_plus_five_days_still_works() {
+        // Existing Duration arithmetic must keep working. The display
+        // propagates `days`, so the result renders as "10 days" rather than
+        // HMS — same as before the date/time work.
+        assert_eq!(fmt("5 days + 5 days"), "10 days");
+        // Round-trip via in-conversion also still works.
+        assert_eq!(fmt("(5 days + 5 days) in hms"), "240:00:00.00");
+    }
+
+    #[test]
+    fn cal_days_plus_cal_days() {
+        assert_eq!(fmt("5 cal_days + 5 cal_days"), "P10D");
+    }
+
+    #[test]
+    fn period_assignment_and_reuse() {
+        let mut eng = Engine::new();
+        eng.eval("p = 1 month").unwrap();
+        let r = eng.eval("p + 2 months").unwrap();
+        assert_eq!(crate::format::format(&r), "P3M");
+    }
+
+    #[test]
+    fn instant_assignment_and_reuse() {
+        let mut eng = Engine::new();
+        eng.eval("d = 2026-04-30").unwrap();
+        let r = eng.eval("d + 5 hours").unwrap();
+        assert_eq!(crate::format::format(&r), "2026-04-30T05:00:00Z");
+    }
+
+    #[test]
+    fn ans_with_dates() {
+        let mut eng = Engine::new();
+        eng.eval("2026-04-30").unwrap();
+        let r = eng.eval("Ans + 5 hours").unwrap();
+        assert_eq!(crate::format::format(&r), "2026-04-30T05:00:00Z");
+    }
+
+    #[test]
+    fn sqrt_rejects_instant_and_period() {
+        let mut eng = Engine::new();
+        assert!(matches!(eng.eval("sqrt(2026-04-30)"), Err(Error::TimeArithmetic(_))));
+        assert!(matches!(eng.eval("sqrt(1 month)"), Err(Error::TimeArithmetic(_))));
     }
 }

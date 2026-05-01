@@ -8,7 +8,7 @@
 //! offset metadata; eval applies the offset only when these atoms appear
 //! as bare single-atom literals.
 
-use crate::unit::{AtomDef, Unit, UnitRegistry};
+use crate::unit::{AtomDef, AtomKind, Unit, UnitRegistry};
 
 const DEFAULT_EN: &str = include_str!("../data/default_en.txt");
 const CONSTANTS_EN: &str = include_str!("../data/constants_en.txt");
@@ -35,6 +35,25 @@ impl UnitRegistry {
         }
         if let (Some(km), Some(h)) = (self.lookup_atom("kilometer"), self.lookup_atom("hour")) {
             self.add_atom("kph", km.unit.div(&h.unit), km.factor / h.factor);
+        }
+        // Calendar period atoms. These override pint's linear month/year
+        // definitions (which we skip during loading via `is_period_unit`).
+        // Per the time spec, `month` and `year` are Period-only — there's
+        // no fixed-second value for them without an anchor instant.
+        for name in ["cal_day", "cal_days", "calendar_day", "calendar_days"] {
+            self.add_atom_full(name, AtomDef::period(0, 0, 1));
+        }
+        for name in [
+            "cal_month", "cal_months", "calendar_month", "calendar_months",
+            "month", "months", "mo",
+        ] {
+            self.add_atom_full(name, AtomDef::period(0, 1, 0));
+        }
+        for name in [
+            "cal_year", "cal_years", "calendar_year", "calendar_years",
+            "year", "years", "yr",
+        ] {
+            self.add_atom_full(name, AtomDef::period(1, 0, 0));
         }
     }
 }
@@ -129,9 +148,21 @@ fn parse_definition(reg: &mut UnitRegistry, line: &str) -> Result<(), ()> {
         return Err(());
     }
 
+    // Drop pint's linear month/year definitions — we register `month`,
+    // `year`, etc. as Period atoms after loading per the time spec. If
+    // we let pint's linear definitions through, they'd shadow the Period
+    // registration. Skipping the whole line is simpler than redacting
+    // individual aliases.
+    if is_period_reserved_name(head) {
+        return Ok(());
+    }
+    if aliases.iter().any(|a| is_period_reserved_name(a)) {
+        return Ok(());
+    }
+
     // Pull off `; offset: <expr>` annotation. A non-zero offset means this
     // is an affine temperature scale (Celsius/Fahrenheit). We register it
-    // with the offset baked into the AtomDef and mark `is_affine_temp = true`
+    // with the offset baked into the AtomDef and mark `kind = AffineTemp`
     // so eval can detect bare-atom literals at construction time.
     let (body, offset) = strip_offset(reg, body);
 
@@ -152,8 +183,12 @@ fn parse_definition(reg: &mut UnitRegistry, line: &str) -> Result<(), ()> {
         // Base-unit declarations don't normally have offsets; if one slips
         // through (`kelvin = [temperature]; offset: 0`), treat it as linear.
         let off = offset.unwrap_or(0.0);
-        let is_affine = unit == Unit::KELVIN && off != 0.0;
-        let def = AtomDef { unit, factor, offset: off, is_affine_temp: is_affine };
+        let kind = if unit == Unit::KELVIN && off != 0.0 {
+            AtomKind::AffineTemp
+        } else {
+            AtomKind::Linear
+        };
+        let def = AtomDef { unit, factor, offset: off, kind };
         add_with_plural(reg, head, def);
         for alias in &aliases {
             if is_simple_ident(alias) {
@@ -165,8 +200,12 @@ fn parse_definition(reg: &mut UnitRegistry, line: &str) -> Result<(), ()> {
 
     let (unit, factor) = eval_pint_expr(reg, body)?;
     let off = offset.unwrap_or(0.0);
-    let is_affine = unit == Unit::KELVIN && off != 0.0;
-    let def = AtomDef { unit, factor, offset: off, is_affine_temp: is_affine };
+    let kind = if unit == Unit::KELVIN && off != 0.0 {
+        AtomKind::AffineTemp
+    } else {
+        AtomKind::Linear
+    };
+    let def = AtomDef { unit, factor, offset: off, kind };
     add_with_plural(reg, head, def);
     for alias in &aliases {
         if is_simple_ident(alias) {
@@ -185,6 +224,20 @@ fn add_with_plural(reg: &mut UnitRegistry, name: &str, def: AtomDef) {
     if name.len() >= 3 && !name.ends_with('s') {
         reg.add_atom_full(&format!("{name}s"), def);
     }
+}
+
+/// Names reserved for Period atoms registered after the pint loader runs.
+/// Encountering any of these as a head or alias during pint loading means
+/// "skip this line entirely" — we don't want pint's linear `year = 365.25 *
+/// day` definition shadowing our Period registration.
+fn is_period_reserved_name(name: &str) -> bool {
+    matches!(
+        name,
+        "year" | "years" | "yr"
+            | "month" | "months" | "mo"
+            | "julian_year" | "common_year" | "leap_year"
+            | "gregorian_year" | "sidereal_year" | "tropical_year"
+    )
 }
 
 /// Pull off pint's `; offset: <expr>` annotation. Tries to evaluate the

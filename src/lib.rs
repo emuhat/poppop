@@ -1,5 +1,6 @@
 mod ast;
 mod builtins;
+mod calendar;
 mod error;
 mod eval;
 mod format;

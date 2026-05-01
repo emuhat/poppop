@@ -1,7 +1,8 @@
 use crate::ast::UnitExpr;
+use crate::calendar;
 use crate::eval::Answer;
-use crate::unit::UnitRegistry;
-use crate::value::Value;
+use crate::unit::{AtomKind, UnitRegistry};
+use crate::value::{LinearValue, Value};
 
 pub fn format(answer: &Answer) -> String {
     match answer {
@@ -11,12 +12,16 @@ pub fn format(answer: &Answer) -> String {
 }
 
 pub fn format_value(v: &Value) -> String {
-    // Pure-time formatting (unchanged). Temperature values have `unit == K`,
-    // so this branch doesn't fire for them.
-    //
-    // Reminder: this code branches on `unit.is_pure_time()` to detect TIME,
-    // not temperature. Temperature semantics are determined exclusively by
-    // `is_absolute_temp` / `render_as_delta` (see below).
+    match v {
+        Value::Linear(l) => format_linear(l),
+        Value::Instant(i) => calendar::format_instant(i),
+        Value::Period(p) => calendar::format_period(p),
+    }
+}
+
+fn format_linear(v: &LinearValue) -> String {
+    // Pure-time formatting. Temperature values have `unit == K`, so this
+    // branch doesn't fire for them.
     if v.unit.is_pure_time() && v.mag.is_finite() {
         if v.force_hms {
             return format_hms(v.mag);
@@ -32,9 +37,7 @@ pub fn format_value(v: &Value) -> String {
     }
 
     // Temperature rendering — branches ONLY on `is_absolute_temp` and
-    // `render_as_delta`. Never on `unit` or atom names. The flags are
-    // the entire source of truth for whether this is a temperature value
-    // and how to format it.
+    // `render_as_delta`. Never on `unit` or atom names.
     if v.is_absolute_temp || v.render_as_delta {
         if let Some(s) = render_temperature(v) {
             return s;
@@ -67,11 +70,7 @@ fn is_explicit_time_unit(u: &UnitExpr) -> bool {
     )
 }
 
-/// Render a value carrying a temperature flag (`is_absolute_temp` or
-/// `render_as_delta`). Returns `None` if the display hint doesn't
-/// dimensionally match (we shouldn't see this in practice — eval guards
-/// against it — but the formatter is defensive).
-fn render_temperature(v: &Value) -> Option<String> {
+fn render_temperature(v: &LinearValue) -> Option<String> {
     let display = v.display.as_ref()?;
     let registry = UnitRegistry::standard();
     let r = registry.resolve(display).ok()?;
@@ -81,15 +80,11 @@ fn render_temperature(v: &Value) -> Option<String> {
     if r.factor == 0.0 || !r.factor.is_finite() {
         return None;
     }
-    // For single-atom displays the resolver hands us the AtomDef so we can
-    // tell affine from linear. Compound display targets render as plain
-    // scaled values (no Δ marker, no offset application).
     let atom = r.atom;
+    let is_affine = atom.map(|a| matches!(a.kind, AtomKind::AffineTemp)).unwrap_or(false);
 
     if v.is_absolute_temp {
-        // Absolute reading. Apply the affine inverse for affine displays;
-        // for non-affine displays (K, compound), just scale by factor.
-        let offset = atom.map(|a| if a.is_affine_temp { a.offset } else { 0.0 }).unwrap_or(0.0);
+        let offset = if is_affine { atom.unwrap().offset } else { 0.0 };
         let display_mag = (v.mag - offset) / r.factor;
         let unit_str = render_unit_expr(display);
         return Some(format_with_unit(display_mag, &unit_str));
@@ -98,11 +93,7 @@ fn render_temperature(v: &Value) -> Option<String> {
     if v.render_as_delta {
         let display_mag = v.mag / r.factor;
         let unit_str = render_unit_expr(display);
-        // Δ marker only when displaying a delta in an AFFINE temperature unit
-        // (degC/degF). K and other linear units don't get a marker — K is the
-        // canonical delta unit and a plain "5 K" is unambiguous.
-        let mark_delta = atom.map(|a| a.is_affine_temp).unwrap_or(false);
-        if mark_delta {
+        if is_affine {
             return Some(format!("{} Δ{}", trim_float(display_mag), unit_str));
         }
         return Some(format_with_unit(display_mag, &unit_str));
@@ -120,9 +111,7 @@ fn format_with_unit(mag: f64, unit_str: &str) -> String {
     }
 }
 
-/// Try to render in the value's preferred display unit. Returns None if the
-/// hint doesn't resolve, doesn't dimensionally match, or has zero factor.
-fn render_with_display(v: &Value) -> Option<String> {
+fn render_with_display(v: &LinearValue) -> Option<String> {
     let display = v.display.as_ref()?;
     let registry = UnitRegistry::standard();
     let r = registry.resolve(display).ok()?;

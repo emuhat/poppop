@@ -131,6 +131,7 @@ fn parse_pow_exp(pair: Pair<Rule>) -> Result<Expr, Error> {
 fn parse_atom(pair: Pair<Rule>) -> Result<Expr, Error> {
     let inner = pair.into_inner().next().unwrap();
     match inner.as_rule() {
+        Rule::date_literal => parse_date_literal(inner),
         Rule::time_with_unit => parse_time_with_unit(inner),
         Rule::number => {
             let n: f64 = inner.as_str().parse().unwrap();
@@ -143,6 +144,14 @@ fn parse_atom(pair: Pair<Rule>) -> Result<Expr, Error> {
         Rule::paren => parse_expression(inner.into_inner().next().unwrap()),
         r => unreachable!("atom inner: {r:?}"),
     }
+}
+
+fn parse_date_literal(pair: Pair<Rule>) -> Result<Expr, Error> {
+    let mut it = pair.into_inner();
+    let year: i32 = it.next().unwrap().as_str().parse().unwrap();
+    let month: u32 = it.next().unwrap().as_str().parse().unwrap();
+    let day: u32 = it.next().unwrap().as_str().parse().unwrap();
+    Ok(Expr::DateLiteral(year, month, day))
 }
 
 fn parse_time_with_unit(pair: Pair<Rule>) -> Result<Expr, Error> {

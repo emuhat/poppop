@@ -135,22 +135,47 @@ pub fn unit_time_factor(expr: &UnitExpr) -> f64 {
     }
 }
 
-/// Per-atom registry record. Most units have `offset = 0.0` and
-/// `is_affine_temp = false`. Only Celsius and Fahrenheit (and their aliases)
-/// carry non-zero offsets and `is_affine_temp = true`. The `offset` is the
-/// Kelvin value corresponding to a magnitude of 0 in the affine scale;
-/// e.g. `0 °C = 273.15 K` so degC has offset 273.15.
+/// Tag for what kind of value a registered atom produces. `Linear` is the
+/// default and covers everything except temperatures and calendar periods.
+/// The eval phase consults this to decide whether to apply offset math
+/// (AffineTemp), build a Period value (Period), or just multiply (Linear).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AtomKind {
+    Linear,
+    AffineTemp,
+    /// Calendar period contributed by one unit of this atom. e.g.
+    /// `month` = `Period { years: 0, months: 1, days: 0 }`.
+    Period { years: i32, months: i32, days: i32 },
+}
+
+/// Per-atom registry record. Most units have `kind = Linear`,
+/// `offset = 0.0`. Affine temperatures carry a non-zero `offset`. Period
+/// atoms ignore `unit`/`factor`/`offset`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AtomDef {
     pub unit: Unit,
     pub factor: f64,
     pub offset: f64,
-    pub is_affine_temp: bool,
+    pub kind: AtomKind,
 }
 
 impl AtomDef {
     pub fn linear(unit: Unit, factor: f64) -> Self {
-        AtomDef { unit, factor, offset: 0.0, is_affine_temp: false }
+        AtomDef { unit, factor, offset: 0.0, kind: AtomKind::Linear }
+    }
+
+    #[allow(dead_code)]
+    pub fn affine_temp(unit: Unit, factor: f64, offset: f64) -> Self {
+        AtomDef { unit, factor, offset, kind: AtomKind::AffineTemp }
+    }
+
+    pub fn period(years: i32, months: i32, days: i32) -> Self {
+        AtomDef {
+            unit: Unit::DIMENSIONLESS,
+            factor: 1.0,
+            offset: 0.0,
+            kind: AtomKind::Period { years, months, days },
+        }
     }
 }
 
@@ -225,7 +250,7 @@ impl UnitRegistry {
                         unit: def.unit,
                         factor: def.factor * scale,
                         offset: 0.0,
-                        is_affine_temp: false,
+                        kind: AtomKind::Linear,
                     });
                 }
             }
@@ -304,7 +329,7 @@ mod tests {
         assert_eq!(r.unit, Unit::METERS);
         assert!((r.factor - 1609.344).abs() < 1e-3, "got {}", r.factor);
         assert!(r.atom.is_some());
-        assert!(!r.atom.unwrap().is_affine_temp);
+        assert!(matches!(r.atom.unwrap().kind, AtomKind::Linear));
     }
 
     #[test]
@@ -342,7 +367,7 @@ mod tests {
         let r = reg.resolve(&UnitExpr::Atom("degC".into(), 1)).unwrap();
         assert_eq!(r.unit, Unit::KELVIN);
         let atom = r.atom.expect("single-atom resolution should carry atom info");
-        assert!(atom.is_affine_temp);
+        assert!(matches!(atom.kind, AtomKind::AffineTemp));
         assert!((atom.offset - 273.15).abs() < 1e-9);
     }
 }
